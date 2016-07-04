@@ -33,18 +33,7 @@ public class AppLevelInfoService extends StatefulService {
 		// TODO Auto-generated constructor stub
 	}
 
-	// A custom service document to represent the application information
-	public static class AppDetail extends ServiceDocument {
 
-		public static final String FIELD_NAME_APP_NAME = "name";
-		public static final String FIELD_NAME_APP_ID = "id";
-		public static final String FIELD_NAME_APP_DESC = "description";
-
-		public String name;
-		public int id;
-		public String description;
-
-	}
 
 	@Override
 	public void handleStart(Operation startPost) {
@@ -76,11 +65,11 @@ public class AppLevelInfoService extends StatefulService {
 //	post.complete();
 //	}
 
-	@Override
-	public void handleGet(Operation get) {
-		super.handleGet(get);
-		get.complete();
-	}
+//	@Override
+//	public void handleGet(Operation get) {
+//		super.handleGet(get);
+//		get.complete();
+//	}
 
 	// Create document instances for each entry in the Application JSON
 	public void createDocument(JSONObject app) {

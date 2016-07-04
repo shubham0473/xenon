@@ -26,6 +26,7 @@ public class Host extends ServiceHost{
 
 			AppLevelInfoService app = new AppLevelInfoService();
 			TierLevelInfoService tier = new TierLevelInfoService();
+			NodeLevelInfoService node = new NodeLevelInfoService();
 	        super.start();
 
 	        startDefaultCoreServicesSynchronously();
@@ -40,6 +41,10 @@ public class Host extends ServiceHost{
 			super.startFactory(TierLevelInfoService.class, TierLevelInfoService::createFactory);
 			super.startService(tier);
 			tier.getTierData();
+//
+//			super.startFactory(NodeLevelInfoService.class, NodeLevelInfoService::createFactory);
+//			super.startService(node);
+//			node.getNodeData();
 	        return this;
 	    }
 
