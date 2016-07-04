@@ -20,6 +20,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import org.junit.Before;
@@ -27,6 +28,9 @@ import org.junit.Test;
 
 import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceStats.ServiceStat;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.AggregationType;
+import com.vmware.xenon.common.ServiceStats.TimeSeriesStats.DataPoint;
 import com.vmware.xenon.common.test.TestContext;
 import com.vmware.xenon.services.common.ExampleService;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
@@ -194,6 +198,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         ServiceStats.ServiceStat stat = new ServiceStat();
         stat.name = "key1";
         stat.latestValue = 100;
+        stat.unit = "unit";
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         ServiceStats allStats = this.host.getServiceState(null, ServiceStats.class,
@@ -203,9 +208,11 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 100);
         assertTrue(retStatEntry.latestValue == 100);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("unit"));
         // Step 3 - POST a stat with the same key again and verify that the
         // version and accumulated value are updated
         stat.latestValue = 50;
+        stat.unit = "unit1";
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
@@ -214,10 +221,12 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 150);
         assertTrue(retStatEntry.latestValue == 50);
         assertTrue(retStatEntry.version == 2);
+        assertTrue(retStatEntry.unit.equals("unit1"));
         // Step 4 - POST a stat with a new key and verify that the
         // previously posted stat is not updated
         stat.name = "key2";
         stat.latestValue = 50;
+        stat.unit = "unit2";
         this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
@@ -226,14 +235,17 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 150);
         assertTrue(retStatEntry.latestValue == 50);
         assertTrue(retStatEntry.version == 2);
+        assertTrue(retStatEntry.unit.equals("unit1"));
         retStatEntry = allStats.entries.get("key2");
         assertTrue(retStatEntry.accumulatedValue == 50);
         assertTrue(retStatEntry.latestValue == 50);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("unit2"));
 
         // Step 5 - Issue a PUT for the first stat key and verify that the doc state is replaced
         stat.name = "key1";
         stat.latestValue = 75;
+        stat.unit = "replaceUnit";
         this.host.sendAndWaitExpectSuccess(Operation.createPut(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stat));
         allStats = this.host.getServiceState(null, ServiceStats.class, UriUtils.buildStatsUri(
@@ -242,10 +254,12 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 75);
         assertTrue(retStatEntry.latestValue == 75);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("replaceUnit"));
         // Step 6 - Issue a bulk PUT and verify that the complete set of stats is updated
         ServiceStats stats = new ServiceStats();
         stat.name = "key3";
         stat.latestValue = 200;
+        stat.unit = "unit3";
         stats.entries.put("key3", stat);
         this.host.sendAndWaitExpectSuccess(Operation.createPut(UriUtils.buildStatsUri(
                 this.host, exampleServiceState.documentSelfLink)).setBody(stats));
@@ -265,6 +279,7 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         assertTrue(retStatEntry.accumulatedValue == 200);
         assertTrue(retStatEntry.latestValue == 200);
         assertTrue(retStatEntry.version == 1);
+        assertTrue(retStatEntry.unit.equals("unit3"));
         // Step 7 - Issue a PATCH and verify that the latestValue is updated
         stat.latestValue = 25;
         this.host.sendAndWaitExpectSuccess(Operation.createPatch(UriUtils.buildStatsUri(
@@ -274,6 +289,100 @@ public class TestUtilityService extends BasicReusableHostTestCase {
         retStatEntry = allStats.entries.get("key3");
         assertTrue(retStatEntry.latestValue == 225);
         assertTrue(retStatEntry.version == 2);
+    }
+
+    @Test
+    public void testTimeSeriesStats() throws Throwable {
+        long startTime = TimeUnit.MILLISECONDS.toMicros(System.currentTimeMillis());
+        int numBuckets = 4;
+        long interval = 1000;
+        double value = 100;
+        // set data to fill up the specified number of buckets
+        TimeSeriesStats timeSeriesStats = new TimeSeriesStats(numBuckets, interval, EnumSet.allOf(AggregationType.class));
+        for (int i = 0; i < numBuckets; i++) {
+            startTime += TimeUnit.MILLISECONDS.toMicros(interval);
+            value += 1;
+            timeSeriesStats.add(startTime, value);
+        }
+        assertTrue(timeSeriesStats.dataPoints.size() == numBuckets);
+        // insert additional unique datapoints; the earliest entries should be dropped
+        for (int i = 0; i < numBuckets / 2; i++) {
+            startTime += TimeUnit.MILLISECONDS.toMicros(interval);
+            value += 1;
+            timeSeriesStats.add(startTime, value);
+        }
+        assertTrue(timeSeriesStats.dataPoints.size() == numBuckets);
+        long timeMicros = startTime - TimeUnit.MILLISECONDS.toMicros(interval * (numBuckets - 1));
+        long timeMillis = TimeUnit.MICROSECONDS.toMillis(timeMicros);
+        timeMillis -= (timeMillis % interval);
+        assertTrue(timeSeriesStats.dataPoints.firstKey() == timeMillis);
+
+        // insert additional datapoints for an existing bucket. The count should increase,
+        // min, max, average computed appropriately
+        double origValue = value;
+        double accumulatedValue = value;
+        double newValue = value;
+        double count = 1;
+        for (int i = 0; i < numBuckets / 2; i++) {
+            newValue++;
+            count++;
+            timeSeriesStats.add(startTime, newValue);
+            accumulatedValue += newValue;
+        }
+        DataPoint lastDatapoint = timeSeriesStats.dataPoints.get(timeSeriesStats.dataPoints.lastKey());
+        assertTrue(lastDatapoint.avg.equals(accumulatedValue / count));
+        assertTrue(lastDatapoint.count == count);
+        assertTrue(lastDatapoint.max.equals(newValue));
+        assertTrue(lastDatapoint.min.equals(origValue));
+
+        // test with a subset of the aggregation types specified
+        timeSeriesStats = new TimeSeriesStats(numBuckets, interval, EnumSet.of(AggregationType.AVG));
+        timeSeriesStats.add(startTime, value);
+        lastDatapoint = timeSeriesStats.dataPoints.get(timeSeriesStats.dataPoints.lastKey());
+        assertTrue(lastDatapoint.avg != null);
+        assertTrue(lastDatapoint.count != 0);
+        assertTrue(lastDatapoint.max == null);
+        assertTrue(lastDatapoint.min == null);
+
+        timeSeriesStats = new TimeSeriesStats(numBuckets, interval, EnumSet.of(AggregationType.MIN, AggregationType.MAX));
+        timeSeriesStats.add(startTime, value);
+        lastDatapoint = timeSeriesStats.dataPoints.get(timeSeriesStats.dataPoints.lastKey());
+        assertTrue(lastDatapoint.avg == null);
+        assertTrue(lastDatapoint.count == 0);
+        assertTrue(lastDatapoint.max != null);
+        assertTrue(lastDatapoint.min != null);
+
+        // Step 2 - POST a stat to the service instance and verify we can fetch the stat just posted
+        String name = UUID.randomUUID().toString();
+        ExampleServiceState s = new ExampleServiceState();
+        s.name = name;
+        Consumer<Operation> bodySetter = (o) -> {
+            o.setBody(s);
+        };
+        URI factoryURI = UriUtils.buildFactoryUri(this.host, ExampleService.class);
+        Map<URI, ExampleServiceState> states = this.host.doFactoryChildServiceStart(null, 1,
+                ExampleServiceState.class, bodySetter, factoryURI);
+        ExampleServiceState exampleServiceState = states.values().iterator().next();
+        ServiceStats.ServiceStat stat = new ServiceStat();
+        stat.name = "key1";
+        stat.latestValue = 100;
+        // set bucket size to 1ms
+        stat.timeSeriesStats = new TimeSeriesStats(numBuckets, 1, EnumSet.allOf(AggregationType.class));
+        this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
+                this.host, exampleServiceState.documentSelfLink)).setBody(stat));
+        for (int i = 0; i < numBuckets; i++) {
+            Thread.sleep(1);
+            this.host.sendAndWaitExpectSuccess(Operation.createPost(UriUtils.buildStatsUri(
+                    this.host, exampleServiceState.documentSelfLink)).setBody(stat));
+        }
+        ServiceStats allStats = this.host.getServiceState(null, ServiceStats.class,
+                UriUtils.buildStatsUri(
+                        this.host, exampleServiceState.documentSelfLink));
+        ServiceStat retStatEntry = allStats.entries.get(stat.name);
+        assertTrue(retStatEntry.accumulatedValue == 100 * (numBuckets + 1));
+        assertTrue(retStatEntry.latestValue == 100);
+        assertTrue(retStatEntry.version == numBuckets + 1);
+        assertTrue(retStatEntry.timeSeriesStats.dataPoints.size() == numBuckets);
     }
 
     public static class SetAvailableValidationService extends StatefulService {

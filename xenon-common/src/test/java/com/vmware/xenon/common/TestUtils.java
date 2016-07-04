@@ -18,6 +18,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.net.URLEncoder;
@@ -27,7 +28,6 @@ import java.nio.file.Paths;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
-import java.util.Arrays;
 import java.util.Calendar;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -40,6 +40,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
+import java.util.zip.GZIPOutputStream;
 
 import com.google.gson.reflect.TypeToken;
 
@@ -53,12 +54,22 @@ import com.vmware.xenon.common.SystemHostInfo.OsFamily;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
 import com.vmware.xenon.services.common.QueryValidationTestService.QueryValidationServiceState;
-import com.vmware.xenon.services.common.ServiceUriPaths;
-
 
 public class TestUtils {
 
     public int iterationCount = 1000;
+
+    @Test
+    public void registerKind() {
+        String kindBefore = Utils.buildKind(ExampleServiceState.class);
+        String newKind = "e";
+        Utils.registerKind(ExampleServiceState.class, newKind);
+        String kindAfter = Utils.buildKind(ExampleServiceState.class);
+        assertEquals(newKind, kindAfter);
+        Utils.registerKind(ExampleServiceState.class, kindBefore);
+        kindAfter = Utils.buildKind(ExampleServiceState.class);
+        assertEquals(kindBefore, kindAfter);
+    }
 
     @Test
     public void toHexString() {
@@ -315,7 +326,7 @@ public class TestUtils {
 
     public void logThroughput(int count, boolean useBinary, ServiceDocumentDescription desc,
             ServiceDocument original)
-                    throws Throwable {
+            throws Throwable {
 
         long s = Utils.getNowMicrosUtc();
         long length = 0;
@@ -346,7 +357,7 @@ public class TestUtils {
 
     public QueryValidationServiceState serializedAndCompareDocuments(
             boolean useBinary, QueryValidationServiceState original)
-                    throws Throwable {
+            throws Throwable {
         QueryValidationServiceState originalDeserializedWithSig = null;
         if (useBinary) {
             byte[] serializedDocument = new byte[4096];
@@ -516,7 +527,7 @@ public class TestUtils {
         options = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE, ServiceOption.ON_DEMAND_LOAD);
         checkOptions(options, true);
 
-        options = EnumSet.of(ServiceOption.ON_DEMAND_LOAD);
+        options = EnumSet.of(ServiceOption.ON_DEMAND_LOAD, ServiceOption.PERSISTENCE);
         checkOptions(options, false);
     }
 
@@ -670,115 +681,11 @@ public class TestUtils {
     }
 
     @Test
-    public void testMergeQueryResultsWithSameData() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithDifferentData() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 3, 4, 5, 7, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 10, 2, 3, 4, 5, 6, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 1, 10, 2, 3, 4, 8 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithEmptySet() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 1, 3, 4, 5, 7, 8, 9 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 10, 2, 3, 4, 5, 6, 9 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {});
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 1, 10, 2, 3, 4, 5, 6, 7, 8, 9 }));
-    }
-
-    @Test
-    public void testMergeQueryResultsWithAllEmpty() {
-
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(new int[] {});
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(new int[] {});
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(new int[] {});
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, true);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] {}));
-    }
-
-    @Test
-    public void testMergeQueryResultsInDescOrder() {
-        ServiceDocumentQueryResult result1 = createServiceDocumentQueryResult(
-                new int[] { 9, 7, 5, 4, 3, 1 });
-        ServiceDocumentQueryResult result2 = createServiceDocumentQueryResult(
-                new int[] { 9, 6, 5, 4, 3, 2, 10 });
-        ServiceDocumentQueryResult result3 = createServiceDocumentQueryResult(
-                new int[] { 8, 4, 3, 2, 10, 1 });
-
-        List<ServiceDocumentQueryResult> resultsToMerge = Arrays.asList(result1, result2, result3);
-
-        ServiceDocumentQueryResult mergeResult = Utils.mergeQueryResults(resultsToMerge, false);
-
-        assertTrue(verifyMergeResult(mergeResult, new int[] { 9, 8, 7, 6, 5, 4, 3, 2, 10, 1 }));
-    }
-
-    private ServiceDocumentQueryResult createServiceDocumentQueryResult(int[] documentIndices) {
-
-        ServiceDocumentQueryResult result = new ServiceDocumentQueryResult();
-        result.documentCount = (long) documentIndices.length;
-        result.documents = new HashMap<>();
-
-        for (int index : documentIndices) {
-            String documentLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document" + index;
-            result.documentLinks.add(documentLink);
-            result.documents.put(documentLink, new Object());
-        }
-
-        return result;
-    }
-
-    private boolean verifyMergeResult(ServiceDocumentQueryResult mergeResult,
-            int[] expectedSequence) {
-        if (mergeResult.documentCount != expectedSequence.length) {
-            return false;
-        }
-
-        for (int i = 0; i < expectedSequence.length; i++) {
-            String expectedLink = ServiceUriPaths.CORE_LOCAL_QUERY_TASKS + "/document"
-                    + expectedSequence[i];
-            if (!expectedLink.equals(mergeResult.documentLinks.get(i))) {
-                return false;
-            }
-        }
-
-        return true;
+    public void testHash() {
+        String string1 = "foofoo";
+        String string2 = "barbar";
+        Assert.assertEquals(Utils.computeHash(string1), Utils.computeHash(string1));
+        Assert.assertNotEquals(Utils.computeHash(string1), Utils.computeHash(string2));
     }
 
     @Test
@@ -791,5 +698,66 @@ public class TestUtils {
                 Operation.MEDIA_TYPE_APPLICATION_X_WWW_FORM_ENCODED);
 
         Assert.assertEquals(textPlain, textDecoded);
+    }
+
+    @Test
+    public void testValidateStateForUniqueIdentifier() {
+        ExampleServiceState state = new ExampleServiceState();
+        state.id = null;
+        state.required = "testRequiredField";
+        ServiceDocumentDescription desc = buildStateDescription(ExampleServiceState.class, null);
+        Utils.validateState(desc, state);
+        Assert.assertNotNull("Unique Identifier was not provided a default UUID", state.id);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testValidateStateForRequiredField() {
+        ExampleServiceState state = new ExampleServiceState();
+        state.id = null;
+        state.required = null;
+        ServiceDocumentDescription desc = buildStateDescription(ExampleServiceState.class, null);
+        Utils.validateState(desc, state);
+    }
+
+    @Test
+    public void testDecodeGzipedBody() throws Exception {
+        String body = "This is the original body content, bot gzipped";
+        byte[] gzippedBody = compress(body);
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addResponseHeader(Operation.CONTENT_ENCODING_HEADER,
+                        Operation.CONTENT_ENCODING_GZIP)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody));
+
+        assertEquals(body, op.getBody(String.class));
+
+        // Content encoding header is removed as the body is already decoded
+        assertNull(op.getResponseHeader(Operation.CONTENT_ENCODING_HEADER));
+    }
+
+    @Test
+    public void testFailsDecodeGzipedBodyWithoutContentEncoding() throws Exception {
+        byte[] gzippedBody = compress("test");
+
+        Operation op = Operation
+                .createGet(null)
+                .setContentLength(gzippedBody.length)
+                .addResponseHeader(Operation.CONTENT_TYPE_HEADER, Operation.MEDIA_TYPE_TEXT_PLAIN);
+
+        Utils.decodeBody(op, ByteBuffer.wrap(gzippedBody));
+
+        assertEquals(Operation.STATUS_CODE_SERVER_FAILURE_THRESHOLD, op.getStatusCode());
+    }
+
+    private static byte[] compress(String str) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        GZIPOutputStream gzip = new GZIPOutputStream(out);
+        gzip.write(str.getBytes(Utils.CHARSET));
+        gzip.close();
+        return out.toByteArray();
     }
 }

@@ -135,7 +135,7 @@ public abstract class TaskService<T extends TaskService.TaskServiceState>
 
         if (task.taskInfo != null) {
             taskOperation.fail(new IllegalArgumentException(
-                    "Do not specify taskBody: internal use only"));
+                    "Do not specify taskInfo: internal use only"));
             return null;
         }
 
@@ -204,8 +204,7 @@ public abstract class TaskService<T extends TaskService.TaskServiceState>
      * not need to explicitly save the state: that will happen when we call patch.complete()
      */
     protected void updateState(T currentTask, T patchBody) {
-        Utils.mergeWithState(getDocumentTemplate().documentDescription, currentTask, patchBody);
-
+        Utils.mergeWithState(getStateDescription(), currentTask, patchBody);
         // NOTE: If patchBody provides a new expiration, Utils.mergeWithState will take care of it
     }
 

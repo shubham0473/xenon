@@ -19,13 +19,13 @@ import java.net.URI;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import com.vmware.xenon.common.CommandLineArgumentParser;
@@ -50,29 +50,24 @@ public class NettyHttp2Test {
     private VerificationHost host;
 
     // Large operation body size used in basicHttp test.
-    public int largeBodySize = 10000;
+    // Body size is marked larger than the MAX_FRAME_SIZE to
+    // verify that the channel can handle frame aggregation correctly.
+    public int largeBodySize = 100000;
 
     // Number of GETs done in basicHttp2()
     public int requestCount = 10;
 
     // Number of service instances to target
-    public int serviceCount = 16;
+    public int serviceCount = 32;
 
     @BeforeClass
     public static void setUpOnce() throws Exception {
-
-        NettyChannelContext.setMaxRequestSize(1024 * 512);
         HOST = VerificationHost.create(0);
+        HOST.setRequestPayloadSizeLimit(1024 * 512);
+        HOST.setResponsePayloadSizeLimit(1024 * 512);
         CommandLineArgumentParser.parseFromProperties(HOST);
         HOST.setMaintenanceIntervalMicros(
                 TimeUnit.MILLISECONDS.toMicros(VerificationHost.FAST_MAINT_INTERVAL_MILLIS));
-
-        ServiceClient client = NettyHttpServiceClient.create(
-                NettyHttpServiceClientTest.class.getCanonicalName(),
-                Executors.newFixedThreadPool(4),
-                Executors.newScheduledThreadPool(1), HOST);
-
-        HOST.setClient(client);
 
         try {
             HOST.start();
@@ -97,6 +92,7 @@ public class NettyHttp2Test {
 
     @After
     public void cleanUp() {
+        NettyChannelContext.setMaxStreamId(Integer.MAX_VALUE / 2);
     }
 
     /**
@@ -133,7 +129,7 @@ public class NettyHttp2Test {
         this.host.testStart(1);
         Operation put = Operation.createPut(u)
                 .forceRemote()
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_USE_HTTP2)
+                .setConnectionSharing(true)
                 .setBody(largeState)
                 .setCompletion((o, e) -> {
                     if (e != null) {
@@ -156,11 +152,10 @@ public class NettyHttp2Test {
         this.host.send(put);
         this.host.testWait();
 
-
         // Part 2: GET the large state and ensure it is correct.
         Operation get = Operation.createGet(u)
                 .forceRemote()
-                .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_USE_HTTP2)
+                .setConnectionSharing(true)
                 .setCompletion((o, e) -> {
                     if (e != null) {
                         this.host.failIteration(e);
@@ -205,6 +200,9 @@ public class NettyHttp2Test {
         initialState.stringValue = UUID.randomUUID().toString();
         this.host.startServiceAndWait(service, UUID.randomUUID().toString(), initialState);
 
+        // we must set connection limit to 1, to ensure a single http2 connection
+        this.host.getClient().setConnectionLimitPerHost(1);
+
         // We do an initial GET, which opens the connection. We don't get multiplexing
         // until after the connection has been opened.
         URI serviceUri = service.getUri();
@@ -229,7 +227,7 @@ public class NettyHttp2Test {
             Operation getRequest = Operation
                     .createGet(u)
                     .forceRemote()
-                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_USE_HTTP2)
+                    .setConnectionSharing(true)
                     .setCompletion((o, e) -> {
                         if (e != null) {
                             this.host.failIteration(e);
@@ -244,7 +242,6 @@ public class NettyHttp2Test {
         assertTrue(completionTimes[0] > completionTimes[1]);
         this.host.log("Test passed: validateHttp2Multiplexing");
     }
-
 
     /**
      * Validate that when we have a request that times out, everything proceeds as expected.
@@ -269,13 +266,18 @@ public class NettyHttp2Test {
         MinimalTestServiceState body = new MinimalTestServiceState();
         body.id = MinimalTestService.STRING_MARKER_TIMEOUT_REQUEST;
 
+        // force single connection
+        this.host.getClient().setConnectionLimitPerHost(1);
+        this.host.connectionTag = ServiceClient.CONNECTION_TAG_HTTP2_DEFAULT;
+        this.host.getClient().setConnectionLimitPerTag(this.host.connectionTag, 1);
+
         int count = 10;
         this.host.testStart(count);
         for (int i = 0; i < count; i++) {
             Operation request = Operation
                     .createPatch(service.getUri())
                     .forceRemote()
-                    .addPragmaDirective(Operation.PRAGMA_DIRECTIVE_USE_HTTP2)
+                    .setConnectionSharing(true)
                     .setBody(body)
                     .setCompletion((o, e) -> {
                         if (e != null) {
@@ -296,8 +298,8 @@ public class NettyHttp2Test {
         // are only odd-numbered (1, 3, ...). So if we have 2*count streams, we re-used a single
         // connection for the entire test.
         NettyHttpServiceClient client = (NettyHttpServiceClient) this.host.getClient();
-        NettyChannelContext context = client.getCurrentHttp2Context(
-                ServiceHost.LOCAL_HOST, this.host.getPort());
+        NettyChannelContext context = client.getInUseHttp2Context(
+                this.host.connectionTag, ServiceHost.LOCAL_HOST, this.host.getPort());
         assertTrue(context.getLargestStreamId() > count * 2);
         this.host.log("Test passed: validateHttp2Timeouts");
     }
@@ -307,11 +309,12 @@ public class NettyHttp2Test {
      * them all, a new connection has to be reopened. This tests that we do that correctly.
      * @throws Throwable
      */
+    @Ignore("https://www.pivotaltracker.com/story/show/120392043")
     @Test
     public void validateStreamExhaustion() throws Throwable {
         this.host.log("Starting test: validateStreamExhaustion");
-        int maxStreams = 5;
-        // Allow two requests to be sent per connection by artificially limiting the
+        int maxStreamId = 5;
+        // Allow one request to be sent per connection by artificially limiting the
         // maximum stream id to 5. Why 5? Clients use only odd-numbered streams and
         // stream 1 is for negotiating settings. Therefore streams 3 and 5 are our
         // first two requests.
@@ -354,6 +357,8 @@ public class NettyHttp2Test {
         //
         //  for more detail: https://www.pivotaltracker.com/story/show/110535602
         int count = 99;
+        this.host.connectionTag = ServiceClient.CONNECTION_TAG_HTTP2_DEFAULT;
+        this.host.getClient().setConnectionLimitPerTag(this.host.connectionTag, 1);
         URI serviceUri = service.getUri();
         for (int i = 0; i < count; i++) {
             MinimalTestServiceState getResult = this.host.getServiceState(
@@ -363,16 +368,20 @@ public class NettyHttp2Test {
         }
 
         NettyHttpServiceClient client = (NettyHttpServiceClient) this.host.getClient();
-        NettyChannelContext context = client.getCurrentHttp2Context(
-                ServiceHost.LOCAL_HOST, this.host.getPort());
-        assertTrue(context.getLargestStreamId() <= maxStreams);
+        NettyChannelContext context = client.getInUseHttp2Context(
+                this.host.connectionTag, ServiceHost.LOCAL_HOST, this.host.getPort());
+        assertTrue(context.getLargestStreamId() <= maxStreamId);
         this.host.log("HTTP/2 connections correctly reopen when streams are exhausted");
 
-        // We run the maintenance, then ensure we have one connection open.
-        client.handleMaintenance(Operation.createPost(null)
-                .setCompletion((o, e) -> {
-                }));
-        assertTrue(client.countHttp2Contexts(ServiceHost.LOCAL_HOST, this.host.getPort()) == 1);
+        this.host.waitFor("exhausted http2 channels not closed", () -> {
+            // We run the maintenance, then ensure we have one connection open.
+            client.handleMaintenance(Operation.createPost(null));
+            int c = client.getInUseContextCount(
+                    this.host.connectionTag, ServiceHost.LOCAL_HOST, this.host.getPort());
+            this.host.log("Active http2 streams: %d, expected 1", c);
+            return c == 1;
+        });
+
         NettyChannelContext.setMaxStreamId(NettyChannelContext.DEFAULT_MAX_STREAM_ID);
         this.host.log("Test passed: validateStreamExhaustion");
 
@@ -389,16 +398,44 @@ public class NettyHttp2Test {
                 this.host.buildMinimalTestState(),
                 null, null);
 
+        // use global limit, which applies by default to all tags
+        int limit = this.host.getClient()
+                .getConnectionLimitPerTag(ServiceClient.CONNECTION_TAG_HTTP2_DEFAULT);
+        this.host.connectionTag = null;
+        this.host.log("Using default http2 connection limit %d", limit);
+        //this.host.getClient().setConnectionLimitPerHost(limit);
         for (int i = 0; i < 5; i++) {
             this.host.doPutPerService(
                     this.requestCount,
                     EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.HTTP2),
                     services);
-            for (int k = 0; k < 5; k++) {
-                Runtime.getRuntime().gc();
-                Runtime.getRuntime().runFinalization();
-            }
+            this.host.waitForGC();
+            this.host.doPutPerService(
+                    this.requestCount,
+                    EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.HTTP2,
+                            TestProperty.BINARY_SERIALIZATION),
+                    services);
+            this.host.waitForGC();
         }
+
+        // do some in process runs, do verify perf is not degraded
+        for (int i = 0; i < 5; i++) {
+            this.host.doPutPerService(
+                    this.requestCount,
+                    EnumSet.noneOf(TestProperty.class),
+                    services);
+            this.host.waitForGC();
+        }
+
+        // set a specific tag limit
+        limit = 16;
+        this.host.connectionTag = "http2test";
+        this.host.log("Using tag specific connection limit %d", limit);
+        this.host.getClient().setConnectionLimitPerTag(this.host.connectionTag, limit);
+        this.host.doPutPerService(
+                this.requestCount,
+                EnumSet.of(TestProperty.FORCE_REMOTE, TestProperty.HTTP2),
+                services);
     }
 
     /**

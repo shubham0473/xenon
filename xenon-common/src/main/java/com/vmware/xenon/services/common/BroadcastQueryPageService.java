@@ -28,14 +28,15 @@ import com.vmware.xenon.common.StatelessService;
 import com.vmware.xenon.common.TaskState;
 import com.vmware.xenon.common.UriUtils;
 import com.vmware.xenon.common.Utils;
+import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
 
 public class BroadcastQueryPageService extends StatelessService {
     public static final String SELF_LINK_PREFIX = "broadcast-query-page";
     public static final String KIND = Utils.buildKind(QueryTask.class);
 
-    private QueryTask.QuerySpecification spec;
-    private List<String> pageLinks;
-    private long expirationMicros;
+    private final QueryTask.QuerySpecification spec;
+    private final List<String> pageLinks;
+    private final long expirationMicros;
 
     public BroadcastQueryPageService(QueryTask.QuerySpecification spec, List<String> pageLinks,
             long expMicros) {
@@ -73,7 +74,7 @@ public class BroadcastQueryPageService extends StatelessService {
         for (String indexLink : this.pageLinks) {
             Operation op = Operation
                     .createGet(UriUtils.buildUri(this.getHost(), indexLink))
-                    .setReferer(get.getReferer())
+                    .transferRefererFrom(get)
                     .setExpiration(
                             Utils.getNowMicrosUtc() + getHost().getOperationTimeoutMicros() / 3)
                     .setCompletion((o, e) -> {
@@ -99,6 +100,7 @@ public class BroadcastQueryPageService extends StatelessService {
         List<ServiceDocumentQueryResult> queryResults = new ArrayList<>();
         List<String> nextPageLinks = new ArrayList<>();
         List<String> prevPageLinks = new ArrayList<>();
+        EnumSet<QueryOption> options = EnumSet.noneOf(QueryOption.class);
         for (QueryTask rsp : responses) {
             if (rsp.results == null) {
                 continue;
@@ -113,11 +115,17 @@ public class BroadcastQueryPageService extends StatelessService {
             if (rsp.results.prevPageLink != null) {
                 prevPageLinks.add(rsp.results.prevPageLink);
             }
+
+            if (rsp.querySpec != null && rsp.querySpec.options != null) {
+                options = rsp.querySpec.options;
+            }
         }
 
         boolean isAscOrder = this.spec.sortOrder == null
                 || this.spec.sortOrder == QueryTask.QuerySpecification.SortOrder.ASC;
-        ServiceDocumentQueryResult mergeResults = Utils.mergeQueryResults(queryResults, isAscOrder);
+        ServiceDocumentQueryResult mergeResults = QueryTaskUtils.mergeQueryResults(queryResults,
+                isAscOrder,
+                options);
 
         if (!nextPageLinks.isEmpty()) {
             mergeResults.nextPageLink = startNewService(nextPageLinks);

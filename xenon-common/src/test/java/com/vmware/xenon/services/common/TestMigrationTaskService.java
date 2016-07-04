@@ -37,11 +37,11 @@ import java.util.stream.Collectors;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import com.vmware.xenon.common.BasicReusableHostTestCase;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Service.ServiceOption;
 import com.vmware.xenon.common.ServiceDocument;
 import com.vmware.xenon.common.ServiceDocumentQueryResult;
 import com.vmware.xenon.common.ServiceStats;
@@ -55,12 +55,12 @@ import com.vmware.xenon.common.test.TestProperty;
 import com.vmware.xenon.common.test.VerificationHost;
 import com.vmware.xenon.common.test.VerificationHost.WaitHandler;
 import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.MigrationTaskService.MigrationOption;
 import com.vmware.xenon.services.common.MigrationTaskService.State;
 import com.vmware.xenon.services.common.QueryTask.NumericRange;
 import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification;
 
-@Ignore
 public class TestMigrationTaskService extends BasicReusableHostTestCase {
     private static final int UNACCESSABLE_PORT = 123;
     private static final URI FAKE_URI = UriUtils.buildUri("127.0.0.1", UNACCESSABLE_PORT, null, null);
@@ -73,7 +73,7 @@ public class TestMigrationTaskService extends BasicReusableHostTestCase {
     private static VerificationHost destinationHost;
 
     public long serviceCount = 10;
-    private int nodeCount = 2;
+    private int nodeCount = 3;
 
     @Before
     public void setUp() throws Throwable {
@@ -91,6 +91,10 @@ public class TestMigrationTaskService extends BasicReusableHostTestCase {
                 host.waitForServiceAvailable(MigrationTaskService.FACTORY_LINK);
             }
         }
+        for (VerificationHost host : this.host.getInProcessHostMap().values()) {
+            host.toggleServiceOptions(UriUtils.buildUri(host, ExampleService.FACTORY_LINK),
+                    EnumSet.of(ServiceOption.IDEMPOTENT_POST), null);
+        }
 
         if (destinationHost == null) {
             destinationHost = VerificationHost.create(0);
@@ -105,6 +109,10 @@ public class TestMigrationTaskService extends BasicReusableHostTestCase {
                 host.waitForServiceAvailable(ExampleService.FACTORY_LINK);
                 host.waitForServiceAvailable(MigrationTaskService.FACTORY_LINK);
             }
+        }
+        for (VerificationHost host : destinationHost.getInProcessHostMap().values()) {
+            host.toggleServiceOptions(UriUtils.buildUri(host, ExampleService.FACTORY_LINK),
+                    EnumSet.of(ServiceOption.IDEMPOTENT_POST), null);
         }
 
         this.sourceFactoryUri = UriUtils.buildUri(getSourceHost(), MigrationTaskService.FACTORY_LINK);
@@ -508,9 +516,79 @@ public class TestMigrationTaskService extends BasicReusableHostTestCase {
 
         waitForServiceCompletion = waitForServiceCompletion(out[0], getDestinationHost());
         stats = getStats(out[0], getDestinationHost());
-        processedDocuments = Long.valueOf((long) stats.entries.get(MigrationTaskService.STAT_NAME_PROCESSED_DOCUMENTS).latestValue);
         assertEquals(waitForServiceCompletion.taskInfo.stage, TaskStage.FINISHED);
+        processedDocuments = Long.valueOf((long) stats.entries.get(MigrationTaskService.STAT_NAME_PROCESSED_DOCUMENTS).latestValue);
         assertEquals(Long.valueOf(this.serviceCount), processedDocuments);
+
+        // check if object is in new host
+        Collection<URI> uris = links.stream()
+                .map(link -> UriUtils.buildUri(getDestinationHost(), link))
+                .collect(Collectors.toList());
+        getDestinationHost().getServiceState(EnumSet.noneOf(TestProperty.class),
+                ExampleServiceState.class, uris);
+    }
+
+    @Test
+    public void successMigrateSameDocumentsTwiceUsingFallback() throws Throwable {
+        // disable idempotent post on destination
+        for (VerificationHost host : destinationHost.getInProcessHostMap().values()) {
+            host.toggleServiceOptions(UriUtils.buildUri(host, ExampleService.FACTORY_LINK),
+                    null, EnumSet.of(ServiceOption.IDEMPOTENT_POST));
+        }
+        // create object in host
+        Collection<String> links = createExampleDocuments(this.exampleSourceFactory, getSourceHost(),
+                this.serviceCount);
+
+        // start migration
+        MigrationTaskService.State migrationState = validMigrationState(
+                ExampleService.FACTORY_LINK);
+        migrationState.migrationOptions = EnumSet.of(MigrationOption.DELETE_AFTER);
+
+        TestContext ctx = testCreate(1);
+        String[] out = new String[1];
+        Operation op = Operation.createPost(this.destinationFactoryUri)
+                .setBody(migrationState)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.log("Post service error: %s", Utils.toString(e));
+                        ctx.failIteration(e);
+                        return;
+                    }
+                    out[0] = o.getBody(State.class).documentSelfLink;
+                    ctx.completeIteration();
+                });
+        getDestinationHost().send(op);
+        testWait(ctx);
+
+        State waitForServiceCompletion = waitForServiceCompletion(out[0], getDestinationHost());
+        ServiceStats stats = getStats(out[0], getDestinationHost());
+        Long processedDocuments = Long.valueOf((long) stats.entries.get(MigrationTaskService.STAT_NAME_PROCESSED_DOCUMENTS).latestValue);
+        assertEquals(TaskStage.FINISHED, waitForServiceCompletion.taskInfo.stage);
+        assertEquals(Long.valueOf(this.serviceCount), processedDocuments);
+
+        TestContext ctx2 = testCreate(1);
+        migrationState.documentSelfLink = null;
+        op = Operation.createPost(this.destinationFactoryUri)
+                .setBody(migrationState)
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        this.host.log("Post service error: %s", Utils.toString(e));
+                        ctx2.failIteration(e);
+                        return;
+                    }
+                    out[0] = o.getBody(State.class).documentSelfLink;
+                    ctx2.completeIteration();
+                });
+        getDestinationHost().send(op);
+        testWait(ctx2);
+
+        waitForServiceCompletion = waitForServiceCompletion(out[0], getDestinationHost());
+        assertEquals(waitForServiceCompletion.taskInfo.stage, TaskStage.FINISHED);
+        stats = getStats(out[0], getDestinationHost());
+        processedDocuments = Long.valueOf((long) stats.entries.get(MigrationTaskService.STAT_NAME_PROCESSED_DOCUMENTS).latestValue);
+        assertEquals(Long.valueOf(this.serviceCount), processedDocuments);
+        stats = getStats(out[0], getDestinationHost());
+        processedDocuments = Long.valueOf((long) stats.entries.get(MigrationTaskService.STAT_NAME_PROCESSED_DOCUMENTS).latestValue);
 
         // check if object is in new host
         Collection<URI> uris = links.stream()

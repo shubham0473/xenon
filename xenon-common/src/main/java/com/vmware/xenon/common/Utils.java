@@ -13,6 +13,7 @@
 
 package com.vmware.xenon.common;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -28,24 +29,23 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
 import java.util.EnumSet;
-import java.util.HashMap;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.zip.GZIPInputStream;
 
 import com.esotericsoftware.kryo.Kryo;
+import com.esotericsoftware.kryo.KryoException;
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
 import com.google.gson.JsonElement;
@@ -68,29 +68,33 @@ import com.vmware.xenon.common.serialization.KryoSerializers.KryoForDocumentThre
 import com.vmware.xenon.common.serialization.KryoSerializers.KryoForObjectThreadLocal;
 import com.vmware.xenon.services.common.ServiceUriPaths;
 
-class DigestThreadLocal extends ThreadLocal<MessageDigest> {
-    @Override
-    protected MessageDigest initialValue() {
-        return Utils.createDigest();
-    }
-}
-
 /**
  * Runtime utility functions
  */
 public class Utils {
-    private static final int BUFFER_INITIAL_CAPACITY = 1 * 1024;
     private static final String CHARSET_UTF_8 = "UTF-8";
     public static final String PROPERTY_NAME_PREFIX = "xenon.";
     public static final String CHARSET = CHARSET_UTF_8;
     public static final String UI_DIRECTORY_NAME = "ui";
 
     private static final char[] HEX_CHARS = "0123456789abcdef".toCharArray();
-    private static final String HASH_NAME_SHA_1 = "SHA-1";
-    public static final String DEFAULT_CONTENT_HASH = HASH_NAME_SHA_1;
 
-    public static final int DEFAULT_THREAD_COUNT = Math.max(4, Runtime.getRuntime()
+    /**
+     * Number of IO threads is used for the HTTP selector event processing. Most of the
+     * work is done in the context of the service host executor so we just use a couple of threads.
+     * Performance work indicates any more threads do not help, rather, they hurt throughput
+     */
+    public static final int DEFAULT_IO_THREAD_COUNT = Math.min(2, Runtime.getRuntime()
             .availableProcessors());
+
+    /**
+     * Number of threads used for the service host executor and shared across service instances.
+     * We add to the total count since the executor will also be used to process I/O selector
+     * events, which will consume threads. Using much more than the number of processors hurts
+     * operation processing throughput.
+     */
+    public static final int DEFAULT_THREAD_COUNT = Math.max(4, Runtime.getRuntime()
+            .availableProcessors() + (DEFAULT_IO_THREAD_COUNT * 2));
 
     /**
      * {@link #isReachableByPing} launches a separate ping process to ascertain whether a given IP
@@ -101,11 +105,14 @@ public class Utils {
 
     private static final KryoForObjectThreadLocal kryoForObjectPerThread = new KryoForObjectThreadLocal();
     private static final KryoForDocumentThreadLocal kryoForDocumentPerThread = new KryoForDocumentThreadLocal();
-    private static final DigestThreadLocal digestPerThread = new DigestThreadLocal();
     private static final BufferThreadLocal bufferPerThread = new BufferThreadLocal();
 
     private static final JsonMapper JSON = new JsonMapper();
     private static final ConcurrentMap<Class<?>, JsonMapper> CUSTOM_JSON = new ConcurrentHashMap<>();
+
+    private static final Map<String, String> KINDS = new ConcurrentSkipListMap<>();
+
+    private static final StringBuilderThreadLocal builderPerThread = new StringBuilderThreadLocal();
 
     private static JsonMapper getJsonMapperFor(Type type) {
         if (type instanceof Class) {
@@ -193,13 +200,7 @@ public class Utils {
         return computeHash(buffer, 0, position);
     }
 
-    private static void appendJson(Object obj, Appendable buf) {
-        JsonMapper mapper = getJsonMapperFor(obj);
-        mapper.toJson(obj, buf);
-    }
-
     public static byte[] getBuffer(int capacity) {
-
         byte[] buffer = bufferPerThread.get();
         if (buffer.length < capacity) {
             buffer = new byte[capacity];
@@ -213,6 +214,11 @@ public class Utils {
         return buffer;
     }
 
+    /**
+     * Serializes an arbitrary object into a binary representation, using full
+     * reference tracking and the object graph serializer.
+     * Must be paired with {@code Utils#fromBytes(byte[], int, int)} or {@code Utils#fromBytes(byte[])}
+     */
     public static int toBytes(Object o, byte[] buffer, int position) {
         Kryo k = kryoForObjectPerThread.get();
         Output out = new Output(buffer);
@@ -221,6 +227,22 @@ public class Utils {
         return out.position();
     }
 
+    /**
+     * Serializes a PODO into a binary representation. The object instance should
+     * not contain circular references.
+     * Must be paired with {@code Utils#fromDocumentBytes(byte[], int, int)}
+     */
+    public static int toDocumentBytes(Object o, byte[] buffer, int position) {
+        Kryo k = kryoForDocumentPerThread.get();
+        Output out = new Output(buffer);
+        out.setPosition(position);
+        k.writeClassAndObject(out, o);
+        return out.position();
+    }
+
+    /**
+     * @see Utils#toDocumentBytes(Object, byte[], int)
+     */
     public static int toBytes(ServiceDocument o, byte[] buffer, int position) {
         Kryo k = kryoForDocumentPerThread.get();
         Output out = new Output(buffer);
@@ -229,16 +251,28 @@ public class Utils {
         return out.position();
     }
 
+    /**
+     * Deserializes into a native object, using the object graph serializer.
+     * Must be paired with {@code Utils#toBytes(Object, byte[], int)}
+     */
     public static Object fromBytes(byte[] bytes) {
         return fromBytes(bytes, 0, bytes.length);
     }
 
+    /**
+     * Deserializes into a native object, using the object graph serializer.
+     * Must be paired with {@code Utils#toBytes(Object, byte[], int)}
+     */
     public static Object fromBytes(byte[] bytes, int offset, int length) {
         Kryo k = kryoForObjectPerThread.get();
         Input in = new Input(bytes, offset, length);
         return k.readClassAndObject(in);
     }
 
+    /**
+     * Deserializes into a native ServiceDocument derived type, using the document serializer.
+     * Must be paired with {@code Utils#toBytes(ServiceDocument, byte[], int)
+     */
     public static Object fromDocumentBytes(byte[] bytes, int offset, int length) {
         Kryo k = kryoForDocumentPerThread.get();
         Input in = new Input(bytes, offset, length);
@@ -255,23 +289,49 @@ public class Utils {
     }
 
     private static String computeHash(byte[] content, int offset, int length) {
-        MessageDigest digest = digestPerThread.get();
-        digest.update(content, offset, length);
-        byte[] hash = digest.digest();
-        return Utils.toHexString(hash);
+        return Integer.toHexString(MurmurHash3.murmurhash3_x86_32(content, offset, length, 0));
     }
 
     public static String toJson(Object body) {
         if (body instanceof String) {
             return (String) body;
         }
-        StringBuilder content = new StringBuilder(BUFFER_INITIAL_CAPACITY);
-        appendJson(body, content);
+        StringBuilder content = getBuilder();
+        JsonMapper mapper = getJsonMapperFor(body);
+        mapper.toJson(body, content);
         return content.toString();
     }
 
     public static String toJsonHtml(Object body) {
-        return getJsonMapperFor(body).toJsonHtml(body);
+        if (body instanceof String) {
+            return (String) body;
+        }
+        StringBuilder content = getBuilder();
+        JsonMapper mapper = getJsonMapperFor(body);
+        mapper.toJsonHtml(body, content);
+        return content.toString();
+    }
+
+    /**
+     * Outputs a JSON representation of the given object using useHTMLFormatting to create pretty-printed,
+     * HTML-friendly JSON or compact JSON. If hideSensitiveFields is set the JSON will not include fields
+     * with the annotation {@link PropertyUsageOption#SENSITIVE}.
+     * If hideSensitiveFields is set and the Object is a string with JSON, sensitive fields cannot be discovered will
+     * throw an Exception.
+     */
+    public static String toJson(boolean hideSensitiveFields, boolean useHtmlFormatting, Object body)
+            throws IllegalArgumentException {
+        if (body instanceof String) {
+            if (hideSensitiveFields) {
+                throw new IllegalArgumentException(
+                        "Body is already a string, sensitive fields cannot be discovered");
+            }
+            return (String) body;
+        }
+        StringBuilder content = getBuilder();
+        JsonMapper mapper = getJsonMapperFor(body);
+        mapper.toJson(hideSensitiveFields, useHtmlFormatting, body, content);
+        return content.toString();
     }
 
     public static <T> T fromJson(String json, Class<T> clazz) {
@@ -404,8 +464,29 @@ public class Utils {
         return time;
     }
 
+    public static String toDocumentKind(Class<?> type) {
+        String name = type.getCanonicalName();
+        String kind = name.replace(".", ":");
+        return kind;
+    }
+
+    /**
+     * Registers mapping between a type and document kind string the runtime
+     * will use for all services with that state type
+     */
+    public static String registerKind(Class<?> type, String kind) {
+        return KINDS.put(type.getCanonicalName(), kind);
+    }
+
+    /**
+     * Builds a kind string from a type. It uses a cache to lookup the type to kind
+     * mapping. The mapping can be overridden with {@code Utils#registerKind(Class, String)}
+     */
     public static String buildKind(Class<?> type) {
-        return type.getCanonicalName().replace(".", ":");
+        String kind = KINDS.computeIfAbsent(type.getCanonicalName(), (name) -> {
+            return toDocumentKind(type);
+        });
+        return kind;
     }
 
     public static ServiceErrorResponse toServiceErrorResponse(Throwable e) {
@@ -543,7 +624,12 @@ public class Utils {
         case UTILITY:
             break;
         case ON_DEMAND_LOAD:
+            if (!options.contains(ServiceOption.FACTORY)) {
+                reqs = EnumSet.of(ServiceOption.PERSISTENCE);
+            }
             antiReqs = EnumSet.of(ServiceOption.PERIODIC_MAINTENANCE);
+            break;
+        case TRANSACTION_PENDING:
             break;
         default:
             break;
@@ -587,6 +673,30 @@ public class Utils {
         return null;
     }
 
+    /**
+     * Infrastructure use only
+     */
+    static boolean validateServiceOptions(ServiceHost host, Service service, Operation post) {
+        for (ServiceOption o : service.getOptions()) {
+            String error = Utils.validateServiceOption(service.getOptions(), o);
+            if (error != null) {
+                host.log(Level.WARNING, error);
+                post.fail(new IllegalArgumentException(error));
+                return false;
+            }
+        }
+
+        if (service.getMaintenanceIntervalMicros() > 0 &&
+                service.getMaintenanceIntervalMicros() < host.getMaintenanceIntervalMicros()) {
+            host.log(
+                    Level.WARNING,
+                    "Service maint. interval %d is less than host interval %d, reducing host interval",
+                    service.getMaintenanceIntervalMicros(), host.getMaintenanceIntervalMicros());
+            host.setMaintenanceIntervalMicros(service.getMaintenanceIntervalMicros());
+        }
+        return true;
+    }
+
     public static String getOsName(SystemHostInfo systemInfo) {
         return systemInfo.properties.get(SystemHostInfo.PROPERTY_NAME_OS_NAME);
     }
@@ -628,7 +738,7 @@ public class Utils {
                     "-n", "1",
                     "-w", Long.toString(timeoutMs),
                     getNormalizedHostAddress(systemInfo, addr))
-                            .start();
+                    .start();
             boolean completed = process.waitFor(
                     PING_LAUNCH_TOLERANCE_MS + timeoutMs,
                     TimeUnit.MILLISECONDS);
@@ -646,8 +756,8 @@ public class Utils {
      * Specifically, Java formats link-local IPv6 addresses in Linux-friendly manner:
      * {@code <address>%<interface_name>} e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%eth0}. However,
      * Windows requires a different format for such addresses: {@code <address>%<numeric_scope_id>}
-     * e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%34}. This method {@link #isWindowsHost detects if
-     * the caller is a Windows host} and will adjust the host address accordingly.
+     * e.g. {@code fe80:0:0:0:5971:14f6:c8ac:9e8f%34}. This method {@link #determineOsFamily detects if
+     * the OS on the host} and will adjust the host address accordingly.
      *
      * Otherwise, this will delegate to the original method.
      */
@@ -669,16 +779,45 @@ public class Utils {
         return addrStr;
     }
 
-    public static byte[] encodeBody(Operation op) throws Throwable {
-        byte[] data = null;
-        String contentType = op.getContentType();
+    /**
+     * Infrastructure use. Serializes linked state associated with source operation
+     * and sets the result as the body of the target operation
+     */
+    public static void encodeAndTransferLinkedStateToBody(Operation source, Operation target,
+            boolean useBinary) {
+        if (useBinary && source.getAction() != Action.POST) {
+            try {
+                byte[] encodedBody = Utils.encodeBody(source, source.getLinkedState(),
+                        Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM);
+                source.linkSerializedState(encodedBody);
+            } catch (Throwable e2) {
+                Utils.logWarning("Failure binary serializing, will fallback to JSON: %s",
+                        Utils.toString(e2));
+            }
+        }
 
-        if (!op.hasBody()) {
+        if (!source.hasLinkedSerializedState()) {
+            target.setContentType(Operation.MEDIA_TYPE_APPLICATION_JSON);
+            target.setBodyNoCloning(Utils.toJson(source.getLinkedState()));
+        } else {
+            target.setContentType(Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM);
+            target.setBodyNoCloning(source.getLinkedSerializedState());
+        }
+    }
+
+    public static byte[] encodeBody(Operation op) throws Throwable {
+        return encodeBody(op, op.getBodyRaw(), op.getContentType());
+    }
+
+    public static byte[] encodeBody(Operation op, Object body, String contentType)
+            throws Throwable {
+        byte[] data = null;
+
+        if (body == null) {
             op.setContentLength(0);
             return null;
         }
 
-        Object body = op.getBodyRaw();
         if (body instanceof String) {
             data = ((String) body).getBytes(Utils.CHARSET);
             op.setContentLength(data.length);
@@ -689,6 +828,21 @@ public class Utils {
             }
             if (op.getContentLength() == 0 || op.getContentLength() > data.length) {
                 op.setContentLength(data.length);
+            }
+        } else if (Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM.equals(contentType)) {
+            int limit = ServiceClient.MAX_BINARY_SERIALIZED_BODY_LIMIT;
+            if (op.getContentLength() < 512) {
+                op.setContentLength(512);
+            }
+            while (op.getContentLength() <= limit) {
+                try {
+                    data = new byte[(int) op.getContentLength()];
+                    int count = Utils.toDocumentBytes(body, data, 0);
+                    op.setContentLength(count);
+                    break;
+                } catch (KryoException e) {
+                    op.setContentLength(op.getContentLength() * 2);
+                }
             }
         }
 
@@ -716,25 +870,34 @@ public class Utils {
         }
 
         try {
+            if (Operation.CONTENT_ENCODING_GZIP.equals(op
+                    .getResponseHeader(Operation.CONTENT_ENCODING_HEADER))) {
+                buffer = decompressGZip(buffer);
+                op.getResponseHeaders().remove(Operation.CONTENT_ENCODING_HEADER);
+            }
+
             String contentType = op.getContentType();
             Object body = decodeIfText(buffer, contentType);
-            if (body == null) {
-                // unrecognized or binary body, use the raw bytes
-                byte[] data = new byte[(int) op.getContentLength()];
-                buffer.get(data);
+            if (body != null) {
+                op.setBodyNoCloning(body).complete();
+                return;
+            }
+
+            // unrecognized or binary body, use the raw bytes
+            byte[] data = new byte[(int) op.getContentLength()];
+            buffer.get(data);
+            if (Operation.MEDIA_TYPE_APPLICATION_KRYO_OCTET_STREAM.equals(contentType)) {
+                body = Utils.fromDocumentBytes(data, 0, data.length);
+                if (op.isFromReplication()) {
+                    // optimization to avoid having to serialize state again, during indexing
+                    op.linkSerializedState(data);
+                }
+            } else {
                 body = data;
             }
             op.setBodyNoCloning(body).complete();
         } catch (Throwable e) {
             op.fail(e);
-        }
-    }
-
-    public static MessageDigest createDigest() {
-        try {
-            return MessageDigest.getInstance(DEFAULT_CONTENT_HASH);
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
         }
     }
 
@@ -759,8 +922,26 @@ public class Utils {
         return body;
     }
 
+    private static ByteBuffer decompressGZip(ByteBuffer bb) throws Exception {
+        GZIPInputStream zis = new GZIPInputStream(new ByteBufferInputStream(bb));
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+        try {
+            byte[] buffer = Utils.getBuffer(1024);
+            int len;
+            while ((len = zis.read(buffer)) > 0) {
+                out.write(buffer, 0, len);
+            }
+        } finally {
+            zis.close();
+            out.close();
+        }
+        return ByteBuffer.wrap(out.toByteArray());
+    }
+
     private static boolean isContentTypeText(String contentType) {
-        return contentType.contains(Operation.MEDIA_TYPE_APPLICATION_JSON)
+        return Operation.MEDIA_TYPE_APPLICATION_JSON.equals(contentType)
+                || contentType.contains(Operation.MEDIA_TYPE_APPLICATION_JSON)
                 || contentType.contains("text")
                 || contentType.contains("css")
                 || contentType.contains("script")
@@ -778,7 +959,7 @@ public class Utils {
      * will be calculated using service path Eg. for ExampleService
      * default path will be ui/com/vmware/xenon/services/common/ExampleService
      *
-     * @param type service class for which UI path has to be extracted
+     * @param s service class for which UI path has to be extracted
      * @return UI resource path object
      */
     public static Path getServiceUiResourcePath(Service s) {
@@ -831,15 +1012,16 @@ public class Utils {
     }
 
     /**
-     * Merges {@code patch} object into the {@code source} object by replacing all {@code source} fields with non-null
-     * {@code patch} fields. Only fields with specified merge policy are merged.
+     * Merges {@code patch} object into the {@code source} object by replacing or updating all {@code source}
+     *  fields with non-null {@code patch} fields. Only fields with specified merge policy are merged.
      *
      * @param desc Service document description.
      * @param source Source object.
      * @param patch  Patch object.
      * @param <T>    Object type.
-     * @return {@code true} in case there was at least one update. Updates of fields to same values are not considered
-     *      as updates).
+     * @return {@code true} in case there was at least one update. For objects that are not collections
+     *  or maps, updates of fields to same values are not considered as updates. New elements are always
+     *  added to collections/maps. Elements may replace existing entries based on the collection type
      * @see ServiceDocumentDescription.PropertyUsageOption
      */
     public static <T extends ServiceDocument> boolean mergeWithState(
@@ -855,9 +1037,15 @@ public class Utils {
                     prop.usageOptions.contains(PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)) {
                 Object o = ReflectionUtils.getPropertyValue(prop, patch);
                 if (o != null) {
-                    if (!o.equals(ReflectionUtils.getPropertyValue(prop, source))) {
-                        ReflectionUtils.setPropertyValue(prop, source, o);
+                    if ((prop.typeName == TypeName.COLLECTION && !o.getClass().isArray())
+                            || prop.typeName == TypeName.MAP) {
+                        ReflectionUtils.setOrUpdatePropertyValue(prop, source, o);
                         modified = true;
+                    } else {
+                        if (!o.equals(ReflectionUtils.getPropertyValue(prop, source))) {
+                            ReflectionUtils.setPropertyValue(prop, source, o);
+                            modified = true;
+                        }
                     }
                 }
             }
@@ -866,84 +1054,29 @@ public class Utils {
     }
 
     /**
-     * Merges a list of @ServiceDocumentQueryResult that were already <b>sorted</b> on <i>documentLink</i>.
-     * The merge will be done in linear time.
+     * Validates {@code state} object by checking for null value fields.
      *
-     * @param dataSources A list of @ServiceDocumentQueryResult <b>sorted</b> on <i>documentLink</i>.
-     * @param isAscOrder  Whether the document links are sorted in ascending order.
-     * @return The merging result.
+     * @param desc Service document description.
+     * @param state Source object.
+     * @param <T>    Object type.
+     * @see ServiceDocumentDescription.PropertyUsageOption
      */
-    public static ServiceDocumentQueryResult mergeQueryResults(
-            List<ServiceDocumentQueryResult> dataSources,
-            boolean isAscOrder) {
-
-        // To hold the merge result.
-        ServiceDocumentQueryResult result = new ServiceDocumentQueryResult();
-        result.documents = new HashMap<>();
-        result.documentCount = 0L;
-
-        // For each list of documents to be merged, a pointer is maintained to indicate which element
-        // is to be merged. The initial values are 0s.
-        int[] indices = new int[dataSources.size()];
-
-        // Keep going until the last element in each list has been merged.
-        while (true) {
-            // Always pick the document link that is the smallest or largest depending on "isAscOrder" from
-            // all lists to be merged. "documentLinkPicked" is used to keep the winner.
-            String documentLinkPicked = null;
-
-            // Ties could happen among the lists. That is, multiple elements could be picked in one iteration,
-            // and the lists where they locate need to be recorded so that their pointers could be adjusted accordingly.
-            List<Integer> sourcesPicked = new ArrayList<>();
-
-            // In each iteration, the current elements in all lists need to be compared to pick the winners.
-            for (int i = 0; i < dataSources.size(); i++) {
-                // If the current list still have elements left to be merged, then proceed.
-                if (indices[i] < dataSources.get(i).documentCount) {
-                    String documentLink = dataSources.get(i).documentLinks.get(indices[i]);
-                    if (documentLinkPicked == null) {
-                        // No document link has been picked in this iteration, so it is the winner at the current time.
-                        documentLinkPicked = documentLink;
-                        sourcesPicked.add(i);
+    public static <T extends ServiceDocument> void validateState(
+            ServiceDocumentDescription desc, T state) {
+        for (PropertyDescription prop : desc.propertyDescriptions.values()) {
+            if (prop.usageOptions != null &&
+                    prop.usageOptions.contains(PropertyUsageOption.REQUIRED)) {
+                Object o = ReflectionUtils.getPropertyValue(prop, state);
+                if (o == null) {
+                    if (prop.usageOptions.contains(PropertyUsageOption.ID)) {
+                        ReflectionUtils.setPropertyValue(prop, state, UUID.randomUUID().toString());
                     } else {
-                        if (isAscOrder && documentLink.compareTo(documentLinkPicked) < 0
-                                || !isAscOrder && documentLink.compareTo(documentLinkPicked) > 0) {
-                            // If this document link is smaller or bigger (depending on isAscOrder),
-                            // then replace the original winner.
-                            documentLinkPicked = documentLink;
-                            sourcesPicked.clear();
-                            sourcesPicked.add(i);
-                        } else if (documentLink.equals(documentLinkPicked)) {
-                            // If it is a tie, we will need to record this element too so that
-                            // it won't be processed in the next iteration.
-                            sourcesPicked.add(i);
-                        }
+                        throw new IllegalArgumentException(
+                                prop.accessor.getName() + " is required.");
                     }
                 }
             }
-
-            if (documentLinkPicked != null) {
-                // Save the winner to the result.
-                result.documentLinks.add(documentLinkPicked);
-                ServiceDocumentQueryResult partialResult = dataSources.get(sourcesPicked.get(0));
-                if (partialResult.documents != null) {
-                    result.documents.put(documentLinkPicked,
-                            partialResult.documents.get(documentLinkPicked));
-                }
-                result.documentCount++;
-
-                // Move the pointer of the lists where the winners locate.
-                for (int i : sourcesPicked) {
-                    indices[i]++;
-                }
-            } else {
-                // No document was picked, that means all lists had been processed,
-                // and the merging work is done.
-                break;
-            }
         }
-
-        return result;
     }
 
     /**
@@ -962,7 +1095,7 @@ public class Utils {
 
     /**
      * Gets the time comparison interval, or epsilon.
-     * See {@link setTimeComparisonEpsilonMicros}
+     * See {@link #setTimeComparisonEpsilonMicros}
      * @return
      */
     public static long getTimeComparisonEpsilonMicros() {
@@ -980,4 +1113,8 @@ public class Utils {
         return Math.abs(timeMicros - now) < TIME_COMPARISON_EPSILON_MICROS;
     }
 
+    public static StringBuilder getBuilder() {
+        return builderPerThread.get();
+
+    }
 }

@@ -28,6 +28,7 @@ import io.netty.handler.codec.http2.HttpToHttp2ConnectionHandler;
 
 import com.vmware.xenon.common.Operation;
 import com.vmware.xenon.common.ReflectionUtils;
+import com.vmware.xenon.common.ServiceErrorResponse;
 import com.vmware.xenon.common.Utils;
 
 /**
@@ -79,16 +80,29 @@ public class NettyHttpToHttp2Handler extends HttpToHttp2ConnectionHandler {
         }
 
         Operation oldOperation = socketContext.getOperationForStream(currentStreamId);
-        if (oldOperation != null && oldOperation != operation) {
-            long oldOpId = oldOperation.getId();
-            long opId = operation.getId();
-            // Reusing stream should NOT happen. sign for serious error...
-            Utils.logWarning("Reusing stream %d. opId=%d, oldOpId=%d",
-                    currentStreamId, opId, oldOpId);
+
+        if (oldOperation == null || oldOperation.getId() == operation.getId()) {
+            socketContext.setOperationForStream(currentStreamId, operation);
+            return;
         }
+        long oldOpId = oldOperation.getId();
+        long opId = operation.getId();
+        // Reusing stream should NOT happen. sign for serious error...
+        Utils.logWarning("Reusing stream %d. opId=%d, oldOpId=%d",
+                currentStreamId, opId, oldOpId);
+        Throwable e = new IllegalStateException("HTTP/2 Stream ID collision for id "
+                + currentStreamId);
+        ServiceErrorResponse rsp = ServiceErrorResponse.createWithShouldRetry(e);
 
-        socketContext.setOperationForStream(currentStreamId, operation);
+        oldOperation.setRetryCount(1);
+        operation.setRetryCount(1);
 
+        // fail both operations, close the channel
+        socketContext.setOperation(null);
+        socketContext.removeOperationForStream(currentStreamId);
+        socketContext.close();
+        oldOperation.setBodyNoCloning(rsp).fail(e, rsp.statusCode);
+        operation.setBodyNoCloning(rsp).fail(e, rsp.statusCode);
     }
 
     /**
@@ -124,10 +138,12 @@ public class NettyHttpToHttp2Handler extends HttpToHttp2ConnectionHandler {
         Field field = ReflectionUtils.getField(endpoint.getClass(), "nextReservationStreamId");
 
         try {
+
             int nextReservationStreamId = field.getInt(endpoint);
             return nextReservationStreamId >= 0 ?
                     nextReservationStreamId + 2 :
                     nextReservationStreamId;
+
         } catch (IllegalAccessException e) {
             throw new RuntimeException(e);
         }

@@ -124,6 +124,11 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
         for (Entry<String, String> h : headers) {
             String key = h.getKey();
             String value = h.getValue();
+            if (Operation.STREAM_ID_HEADER.equals(key)) {
+                // Prevent allocation of response headers in Operation and hide the stream ID
+                // header, since it is manipulated by the HTTP layer, not services
+                continue;
+            }
             request.addResponseHeader(key, value);
         }
     }
@@ -167,7 +172,6 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        this.logger.warning(Utils.toString(cause));
         Operation request = ctx.channel().attr(NettyChannelContext.OPERATION_KEY).get();
 
         if (request == null) {
@@ -176,7 +180,7 @@ public class NettyHttpServerResponseHandler extends SimpleChannelInboundHandler<
             // find all the requests and fail all of them. That's slightly risky because
             // we don't understand why we failed, and we may get responses for them later.
             this.logger.info(
-                    "Channel exception but no HTTP/1.1 request to fail" + cause.getMessage());
+                    "Channel exception but no HTTP/1.1 request to fail:" + cause.getMessage());
             return;
         }
 

@@ -62,6 +62,7 @@ public class StatefulService implements Service {
         public String nodeSelectorLink = ServiceUriPaths.DEFAULT_NODE_SELECTOR;
 
         public Set<String> txCoordinatorLinks;
+        public long lastCommitTimeMicros;
     }
 
     private final RuntimeContext context = new RuntimeContext();
@@ -145,8 +146,7 @@ public class StatefulService implements Service {
             op.setEnqueueTime(Utils.getNowMicrosUtc());
         }
 
-        URI referer = op.getReferer();
-        if (referer == null) {
+        if (!op.hasReferer()) {
             op.fail(new IllegalArgumentException("Referer is required"));
             return true;
         }
@@ -501,6 +501,11 @@ public class StatefulService implements Service {
             return false;
         }
 
+        if (request.getRequestHeader(Operation.TRANSACTION_HEADER) != null) {
+            // Skip update checking in case of a transaction control operation
+            return false;
+        }
+
         if (!hasOption(ServiceOption.STRICT_UPDATE_CHECKING)) {
             return false;
         }
@@ -698,6 +703,7 @@ public class StatefulService implements Service {
                 }
 
                 linkedState.documentSelfLink = this.context.selfLink;
+                linkedState.documentUpdateAction = op.getAction().name();
                 if (linkedState.documentKind == null) {
                     linkedState.documentKind = Utils.buildKind(this.context.stateType);
                 }
@@ -761,7 +767,7 @@ public class StatefulService implements Service {
         // DELETE completion runs when a DELETE was issued by a client, not local host shutdown.
         // It needs to stop the service now, since the handleDelete() and handleStop() handlers
         // have already run.
-
+        getHost().markAsPendingDelete(this);
         getHost().stopService(this);
         return false;
     }
@@ -888,10 +894,8 @@ public class StatefulService implements Service {
         // will be behind. Here we re-issue the current state (committed) when we notice the
         // pending operation queue is empty
         if (op.getAction() != Action.DELETE) {
-            synchronized (this.context) {
-                if (!this.context.operationQueue.isEmpty()) {
-                    return;
-                }
+            if (!this.context.operationQueue.isEmpty()) {
+                return;
             }
         } else {
             if (op.hasPragmaDirective(Operation.PRAGMA_DIRECTIVE_NO_INDEX_UPDATE)) {
@@ -901,11 +905,20 @@ public class StatefulService implements Service {
             }
         }
 
-        if (this.getHost().isStopping()) {
+        ServiceDocument latestState = op.getLinkedState();
+        long delta = latestState.documentUpdateTimeMicros - this.context.lastCommitTimeMicros;
+        if (delta < getHost().getMaintenanceIntervalMicros()) {
             return;
         }
 
-        ServiceDocument latestState = op.getLinkedState();
+        if (latestState.documentVersion < this.context.version
+                || (latestState.documentEpoch != null
+                        && latestState.documentEpoch < this.context.epoch)) {
+            return;
+        }
+
+        this.context.lastCommitTimeMicros = latestState.documentUpdateTimeMicros;
+
         URI u = getUri();
         Operation commitOp = Operation
                 .createPut(u)
@@ -918,6 +931,7 @@ public class StatefulService implements Service {
             commitOp.setAction(op.getAction());
         }
 
+        commitOp.linkState(latestState);
         getHost().replicateRequest(this.context.options, latestState, getPeerNodeSelectorPath(),
                 getSelfLink(),
                 commitOp);
@@ -1045,14 +1059,13 @@ public class StatefulService implements Service {
     }
 
     private void applyUpdate(Operation op) throws Throwable {
-        long time = Utils.getNowMicrosUtc();
-
         ServiceDocument cachedState = op.getLinkedState();
         if (cachedState == null) {
             cachedState = this.context.stateType.newInstance();
         }
 
         if (!op.isFromReplication()) {
+            long time = Utils.getNowMicrosUtc();
             if (hasOption(ServiceOption.OWNER_SELECTION)) {
                 cachedState.documentEpoch = this.context.epoch;
             }
@@ -1072,9 +1085,6 @@ public class StatefulService implements Service {
         // a replica simply sets its version to the highest version it has seen. Agreement on
         // owner and epoch is done in validation methods upstream
         this.context.version = Math.max(cachedState.documentVersion, this.context.version);
-
-        cachedState.documentUpdateTimeMicros = Math.max(
-                cachedState.documentUpdateTimeMicros, time);
 
         if (hasOption(ServiceOption.OWNER_SELECTION)) {
             long prevEpoch = this.context.epoch;
@@ -1301,15 +1311,11 @@ public class StatefulService implements Service {
     @Override
     public void toggleOption(ServiceOption option, boolean enable) {
 
-        if (option == ServiceOption.IDEMPOTENT_POST) {
-            throw new IllegalArgumentException("Option not supported on singleton services."
-                    + " Set this service option on the factory service instead.");
-        }
-
         if (option != ServiceOption.HTML_USER_INTERFACE
                 && option != ServiceOption.DOCUMENT_OWNER
                 && option != ServiceOption.PERIODIC_MAINTENANCE
-                && option != ServiceOption.INSTRUMENTATION) {
+                && option != ServiceOption.INSTRUMENTATION
+                && option != ServiceOption.TRANSACTION_PENDING) {
 
             if (getProcessingStage() != Service.ProcessingStage.CREATED) {
                 throw new IllegalStateException("Service already started");
@@ -1320,9 +1326,9 @@ public class StatefulService implements Service {
             toggleOption(ServiceOption.CONCURRENT_GET_HANDLING, true);
         }
 
-        if (option == ServiceOption.PERIODIC_MAINTENANCE && hasOption(ServiceOption
-                .ON_DEMAND_LOAD) || option == ServiceOption.ON_DEMAND_LOAD && hasOption
-                (ServiceOption.PERIODIC_MAINTENANCE)) {
+        if (option == ServiceOption.PERIODIC_MAINTENANCE && hasOption(ServiceOption.ON_DEMAND_LOAD)
+                || option == ServiceOption.ON_DEMAND_LOAD
+                        && hasOption(ServiceOption.PERIODIC_MAINTENANCE)) {
             throw new IllegalArgumentException("Service option PERIODIC_MAINTENANCE and " +
                     "ON_DEMAND_LOAD cannot co-exists.");
         }
@@ -1403,7 +1409,7 @@ public class StatefulService implements Service {
         }
 
         if (stage == ProcessingStage.AVAILABLE) {
-            getHost().processPendingServiceAvailableOperations(this, null);
+            getHost().processPendingServiceAvailableOperations(this, null, false);
         }
     }
 
@@ -1426,6 +1432,13 @@ public class StatefulService implements Service {
             op.setTargetReplicated(true);
         }
         op.setReferer(UriUtils.buildUri(getHost().getPublicUri(), getSelfLink()));
+    }
+
+    /**
+     * Gets the cached ServiceDocumentDescription instance for the service state.
+     */
+    public ServiceDocumentDescription getStateDescription() {
+        return getHost().buildDocumentDescription(this);
     }
 
     /**
@@ -1512,7 +1525,8 @@ public class StatefulService implements Service {
     }
 
     protected void doLogging(Level level, Supplier<String> messageSupplier) {
-        String uri = this.context.host != null && getUri() != null ? getUri().toString() : this.getClass().getSimpleName();
+        String uri = this.context.host != null && getUri() != null ? getUri().toString()
+                : this.getClass().getSimpleName();
         Logger lg = Logger.getLogger(this.getClass().getName());
         Utils.log(lg, 3, uri, level, messageSupplier);
     }
@@ -1536,9 +1550,11 @@ public class StatefulService implements Service {
     @Override
     public void handleMaintenance(Operation post) {
         ServiceMaintenanceRequest request = post.getBody(ServiceMaintenanceRequest.class);
-        if (request.reasons.contains(ServiceMaintenanceRequest.MaintenanceReason.PERIODIC_SCHEDULE)) {
+        if (request.reasons
+                .contains(ServiceMaintenanceRequest.MaintenanceReason.PERIODIC_SCHEDULE)) {
             this.handlePeriodicMaintenance(post);
-        } else if (request.reasons.contains(ServiceMaintenanceRequest.MaintenanceReason.NODE_GROUP_CHANGE)) {
+        } else if (request.reasons
+                .contains(ServiceMaintenanceRequest.MaintenanceReason.NODE_GROUP_CHANGE)) {
             this.handleNodeGroupMaintenance(post);
         } else {
             post.complete();
@@ -1692,7 +1708,8 @@ public class StatefulService implements Service {
 
         if (micros > 0 && micros < Service.MIN_MAINTENANCE_INTERVAL_MICROS) {
             logWarning("Maintenance interval %d is less than the minimum interval %d"
-                    + ", reducing to min interval", micros, Service.MIN_MAINTENANCE_INTERVAL_MICROS);
+                    + ", reducing to min interval", micros,
+                    Service.MIN_MAINTENANCE_INTERVAL_MICROS);
             micros = Service.MIN_MAINTENANCE_INTERVAL_MICROS;
         }
 
@@ -1806,17 +1823,26 @@ public class StatefulService implements Service {
             }
             this.context.txCoordinatorLinks.add(txCoordinatorLink);
         }
+
+        toggleOption(ServiceOption.TRANSACTION_PENDING, true);
     }
 
     /**
      * Removes the specified coordinator link from this service' pending transactions
      */
     void removePendingTransaction(String txCoordinatorLink) {
+        boolean toggleTransactionPending = false;
+
         synchronized (this.context) {
             if (this.context.txCoordinatorLinks == null) {
                 return;
             }
             this.context.txCoordinatorLinks.remove(txCoordinatorLink);
+            toggleTransactionPending = this.context.txCoordinatorLinks.isEmpty();
+        }
+
+        if (toggleTransactionPending) {
+            toggleOption(ServiceOption.TRANSACTION_PENDING, false);
         }
     }
 

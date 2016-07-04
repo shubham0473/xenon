@@ -19,6 +19,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.net.ProtocolException;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -46,6 +47,8 @@ import org.junit.Test;
 
 import com.vmware.xenon.common.CommandLineArgumentParser;
 import com.vmware.xenon.common.Operation;
+import com.vmware.xenon.common.Operation.CompletionHandler;
+import com.vmware.xenon.common.Operation.OperationOption;
 import com.vmware.xenon.common.Service;
 import com.vmware.xenon.common.Service.Action;
 import com.vmware.xenon.common.Service.ServiceOption;
@@ -74,6 +77,7 @@ import com.vmware.xenon.services.common.QueryTask.Query;
 import com.vmware.xenon.services.common.QueryTask.Query.Occurance;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification;
 import com.vmware.xenon.services.common.QueryTask.QuerySpecification.QueryOption;
+import com.vmware.xenon.services.common.QueryTask.QueryTerm;
 import com.vmware.xenon.services.common.QueryTask.QueryTerm.MatchType;
 import com.vmware.xenon.services.common.QueryValidationTestService.QueryValidationServiceState;
 import com.vmware.xenon.services.common.TenantService.TenantState;
@@ -81,7 +85,9 @@ import com.vmware.xenon.services.common.TenantService.TenantState;
 public class TestQueryTaskService {
     private static final String TEXT_VALUE = "the decentralized control plane is a nice framework for queries";
     private static final String SERVICE_LINK_VALUE = "provisioning/dhcp-subnets/192.4.0.0/16";
-    private static final double DOUBLE_MIN_OFFSET = 123.0;
+    private static final long LONG_START_VALUE = -10;
+    private static final double DOUBLE_MIN_OFFSET = -2.0;
+    private static final int SERVICE_LINK_COUNT = 10;
 
     public int serviceCount = 50;
     public int queryCount = 10;
@@ -89,10 +95,18 @@ public class TestQueryTaskService {
     private VerificationHost host;
 
     private void setUpHost() throws Throwable {
+        setUpHost(0);
+    }
+
+    private void setUpHost(int responsePayloadSizeLimit) throws Throwable {
         if (this.host != null) {
             return;
         }
+
         this.host = VerificationHost.create(0);
+        if (responsePayloadSizeLimit > 0) {
+            this.host.setResponsePayloadSizeLimit(responsePayloadSizeLimit);
+        }
         CommandLineArgumentParser.parseFromProperties(this.host);
         CommandLineArgumentParser.parseFromProperties(this);
         try {
@@ -134,11 +148,11 @@ public class TestQueryTaskService {
         ServiceDocumentDescription sdd = b.buildDescription(s.getClass(),
                 EnumSet.of(ServiceOption.PERSISTENCE));
 
-        final int expectedCustomFields = 34;
+        final int expectedCustomFields = 35;
         final int expectedBuiltInFields = 10;
         // Verify the reflection of the root document
         assertTrue(sdd.propertyDescriptions != null && !sdd.propertyDescriptions.isEmpty());
-        assertEquals(sdd.propertyDescriptions.size(), expectedCustomFields + expectedBuiltInFields);
+        assertEquals(expectedCustomFields + expectedBuiltInFields, sdd.propertyDescriptions.size());
 
         pd = sdd.propertyDescriptions.get(ServiceDocument.FIELD_NAME_SOURCE_LINK);
         assertTrue(pd.exampleValue == null);
@@ -160,9 +174,9 @@ public class TestQueryTaskService {
                 sdd);
         assertTrue(descriptionsPerType.get(TypeName.BOOLEAN) == 1L);
         assertTrue(descriptionsPerType.get(TypeName.MAP) == 8L);
-        assertEquals(descriptionsPerType.get(TypeName.LONG), (Long)(1L + 4L + 3L));
+        assertEquals(descriptionsPerType.get(TypeName.LONG), (Long) (1L + 4L + 3L));
         assertTrue(descriptionsPerType.get(TypeName.PODO) == 3L);
-        assertTrue(descriptionsPerType.get(TypeName.COLLECTION) == 7L);
+        assertTrue(descriptionsPerType.get(TypeName.COLLECTION) == 8L);
         assertTrue(descriptionsPerType.get(TypeName.STRING) == 5L + 5L);
         assertTrue(descriptionsPerType.get(TypeName.DATE) == 1L);
         assertTrue(descriptionsPerType.get(TypeName.DOUBLE) == 4L);
@@ -172,7 +186,7 @@ public class TestQueryTaskService {
         assertTrue(pd != null);
         assertTrue(pd.typeName.equals(TypeName.PODO));
         assertTrue(pd.fieldDescriptions != null);
-        assertTrue(pd.fieldDescriptions.size() == 3 + expectedBuiltInFields);
+        assertTrue(pd.fieldDescriptions.size() == 7 + expectedBuiltInFields);
         assertTrue(pd.fieldDescriptions.get("keyValues") != null);
 
         pd = sdd.propertyDescriptions.get("nestedComplexValue");
@@ -509,7 +523,7 @@ public class TestQueryTaskService {
                     ExampleServiceState initialState = new ExampleServiceState();
                     initialState.name = UUID.randomUUID().toString();
                     o.setBody(initialState);
-                } ,
+                },
                 UriUtils.buildFactoryUri(this.host, ExampleService.class));
 
         Query kindClause = Query.Builder.create()
@@ -605,7 +619,7 @@ public class TestQueryTaskService {
     @Test
     public void throughputSimpleQuery() throws Throwable {
         setUpHost();
-        List<URI> services = startQueryTargetServices(this.serviceCount);
+        List<URI> services = createQueryTargetServices(this.serviceCount);
         QueryValidationServiceState newState = new QueryValidationServiceState();
         newState.stringValue = "now";
         newState = putSimpleStateOnQueryTargetServices(services, newState);
@@ -676,7 +690,7 @@ public class TestQueryTaskService {
     public void throughputSimpleQueryDocumentSearch() throws Throwable {
         setUpHost();
 
-        List<URI> services = startQueryTargetServices(this.serviceCount);
+        List<URI> services = createQueryTargetServices(this.serviceCount);
 
         // start two different types of services, creating two sets of documents
         // first start the query validation service instances, setting the id
@@ -714,7 +728,7 @@ public class TestQueryTaskService {
     public void throughputComplexQueryDocumentSearch() throws Throwable {
         setUpHost();
 
-        List<URI> services = startQueryTargetServices(this.serviceCount);
+        List<URI> services = createQueryTargetServices(this.serviceCount);
 
         // start two different types of services, creating two sets of documents
         // first start the query validation service instances, setting the id
@@ -773,6 +787,8 @@ public class TestQueryTaskService {
 
             doInQuery("id",
                     newState.id, services.size(), 1);
+            doNotInQuery("id",
+                    newState.id, services.size(), services.size() - 1);
             doInCollectionQuery("listOfStrings", newState.listOfStrings,
                     services.size(), services.size());
 
@@ -822,6 +838,35 @@ public class TestQueryTaskService {
                 documentCount, expectedResultCount);
     }
 
+    private void doNotInQuery(String fieldName, String fieldValue, long documentCount,
+                           long expectedResultCount) throws Throwable {
+        QuerySpecification spec = new QuerySpecification();
+        spec.query = Query.Builder.create().addInClause(
+                fieldName,
+                Arrays.asList(
+                        UUID.randomUUID().toString(),
+                        fieldValue,
+                        UUID.randomUUID().toString()),
+                Occurance.MUST_NOT_OCCUR)
+                .addFieldClause(ServiceDocument.FIELD_NAME_KIND,
+                        Utils.buildKind(QueryValidationServiceState.class))
+                .build();
+        this.host.createAndWaitSimpleDirectQuery(spec,
+                documentCount, expectedResultCount);
+
+        // Additional Test to verify that  InClause with Array[1] is treated as TERM Query
+        QuerySpecification spec1 = new QuerySpecification();
+        spec1.query = Query.Builder.create().addInClause(
+                fieldName,
+                Arrays.asList(fieldValue),
+                Occurance.MUST_NOT_OCCUR)
+                .addFieldClause(ServiceDocument.FIELD_NAME_KIND,
+                        Utils.buildKind(QueryValidationServiceState.class))
+                .build();
+        this.host.createAndWaitSimpleDirectQuery(spec1,
+                documentCount, expectedResultCount);
+    }
+
     @SuppressWarnings({ "rawtypes" })
     private void doInCollectionQuery(String collName, Collection coll, long documentCount,
             long expectedResultCount)
@@ -841,6 +886,70 @@ public class TestQueryTaskService {
     }
 
     @Test
+    public void selectLinks() throws Throwable {
+        setUpHost();
+        List<URI> services = createQueryTargetServices(this.serviceCount);
+
+        // start two different types of services, creating two sets of documents
+        // first start the query validation service instances, setting the id
+        // field
+        // to the same value
+        QueryValidationServiceState newState = new QueryValidationServiceState();
+        newState.id = UUID.randomUUID().toString();
+        newState = putStateOnQueryTargetServices(services, 1, newState);
+
+        // issue a query that matches kind for the query validation service
+        Query query = Query.Builder.create()
+                .addKindFieldClause(QueryValidationServiceState.class)
+                .build();
+        QueryTask queryTask = QueryTask.Builder.create()
+                .addOption(QueryOption.SELECT_LINKS)
+                .addLinkTerm(QueryValidationServiceState.FIELD_NAME_SERVICE_LINK)
+                .setQuery(query).build();
+
+        createWaitAndValidateQueryTask(1, services, queryTask.querySpec, false);
+
+        // issue a another query this time for the field that has a collection of links
+        query = Query.Builder.create()
+                .addKindFieldClause(QueryValidationServiceState.class)
+                .build();
+        queryTask = QueryTask.Builder.create()
+                .addOption(QueryOption.SELECT_LINKS)
+                .addLinkTerm(QueryValidationServiceState.FIELD_NAME_SERVICE_LINKS)
+                .setQuery(query).build();
+
+        createWaitAndValidateQueryTask(1, services, queryTask.querySpec, false);
+
+        // update query validation services so the serviceLink field points to a real example
+        // service link, then issue a query with EXPAND_LINKS
+        patchQueryTargetServiceLinksWithExampleLinks(services);
+        query = Query.Builder.create()
+                .addKindFieldClause(QueryValidationServiceState.class)
+                .build();
+        queryTask = QueryTask.Builder.create()
+                .addOption(QueryOption.SELECT_LINKS)
+                .addOption(QueryOption.EXPAND_LINKS)
+                .addLinkTerm(QueryValidationServiceState.FIELD_NAME_SERVICE_LINK)
+                .setQuery(query).build();
+
+        createWaitAndValidateQueryTask(1, services, queryTask.querySpec, false);
+
+        // update one of the links to a bogus link value (pointing to a non existent document)
+        // and verify the expanded link, for that document with the broken service link, contains
+        // the ServiceErrorResponse we expect
+        URI queryValidationServiceWithBrokenServiceLink = services.get(0);
+        QueryValidationServiceState patchBody = new QueryValidationServiceState();
+        patchBody.serviceLink = "/some/non/existent/service/some/where-" + UUID.randomUUID();
+        Operation patch = Operation.createPatch(queryValidationServiceWithBrokenServiceLink)
+                .setBody(patchBody);
+        this.host.sendAndWaitExpectSuccess(patch);
+        this.host.createQueryTaskService(queryTask, false,
+                true, queryTask, null);
+        validatedExpandLinksResultsWithBogusLink(queryTask,
+                queryValidationServiceWithBrokenServiceLink);
+    }
+
+    @Test
     public void kindMatch() throws Throwable {
         setUpHost();
         long sc = this.serviceCount;
@@ -857,7 +966,7 @@ public class TestQueryTaskService {
     public void doKindMatchTest(long serviceCount, long versionCount, boolean forceRemote)
             throws Throwable {
 
-        List<URI> services = startQueryTargetServices((int) (serviceCount / 2));
+        List<URI> services = createQueryTargetServices((int) (serviceCount / 2));
 
         // start two different types of services, creating two sets of documents
         // first start the query validation service instances, setting the id
@@ -917,7 +1026,7 @@ public class TestQueryTaskService {
     }
 
     @Test
-    public void broadcastQueryTasksOnExampleStates () throws Throwable {
+    public void multiNodeQueryTaskTests() throws Throwable {
         final int nodeCount = 3;
         final int stressTestServiceCountThreshold = 1000;
 
@@ -936,8 +1045,16 @@ public class TestQueryTaskService {
 
         verifyOnlySupportSortOnSelfLinkInBroadcast(targetHost);
 
-        this.host.testStart(this.serviceCount);
         List<URI> exampleServices = new ArrayList<>();
+        createExampleServices(exampleFactoryURI, exampleServices);
+
+        verifyMultiNodeIndirectQueries(this.host);
+        verifyMultiNodeBroadcastQueries(targetHost);
+    }
+
+    private void createExampleServices(URI exampleFactoryURI, List<URI> exampleServices)
+            throws Throwable {
+        this.host.testStart(this.serviceCount);
         for (int i = 0; i < this.serviceCount; i++) {
             ExampleServiceState s = new ExampleServiceState();
             s.name = "document" + i;
@@ -949,12 +1066,43 @@ public class TestQueryTaskService {
                     .setCompletion(this.host.getCompletion()));
         }
         this.host.testWait();
+    }
 
+    private void verifyMultiNodeIndirectQueries(VerificationHost targetHost) throws Throwable {
+        Query query = Query.Builder.create()
+                .addKindFieldClause(ExampleServiceState.class)
+                .build();
+
+        QueryTask queryTask = QueryTask.Builder.create().setQuery(query).build();
+        queryTask.querySpec.options.add(QueryOption.EXPAND_CONTENT);
+        URI u = targetHost.createQueryTaskService(queryTask);
+
+        QueryTask finishedTaskState = targetHost.waitForQueryTaskCompletion(queryTask.querySpec,
+                this.serviceCount, 1, u, false, false);
+        this.host.log("%s %s", u, finishedTaskState.documentOwner);
+        assertTrue(!finishedTaskState.taskInfo.isDirect);
+    }
+
+    private void verifyMultiNodeBroadcastQueries(VerificationHost targetHost) throws Throwable {
+        verifyOnlySupportSortOnSelfLinkInBroadcast(targetHost);
         verifyDirectQueryAllowedInBroadcast(targetHost);
-        nonpaginatedBroadcastQueryTasksOnExampleStates(targetHost);
+        nonpaginatedBroadcastQueryTasksOnExampleStates(targetHost,
+                EnumSet.of(QueryOption.EXPAND_CONTENT, QueryOption.BROADCAST));
         paginatedBroadcastQueryTasksOnExampleStates(targetHost);
         paginatedBroadcastQueryTasksWithoutMatching(targetHost);
         paginatedBroadcastQueryTasksRepeatSamePage(targetHost);
+
+        // test with QueryOption.OWNER_SELECTION
+        nonpaginatedBroadcastQueryTasksOnExampleStates(targetHost,
+                EnumSet.of(QueryOption.EXPAND_CONTENT, QueryOption.BROADCAST, QueryOption.OWNER_SELECTION));
+
+        nonpaginatedBroadcastQueryTasksOnExampleStates(targetHost,
+                EnumSet.of(QueryOption.BROADCAST, QueryOption.OWNER_SELECTION));
+
+        // send forwardingService to collect and verify each node's local query result,
+        // so QueryOption.BROADCAST is not set here
+        lowLevelBroadcastQueryTasksWithOwnerSelection(targetHost,
+                EnumSet.of(QueryOption.EXPAND_CONTENT, QueryOption.OWNER_SELECTION));
     }
 
     private void verifyOnlySupportSortOnSelfLinkInBroadcast(VerificationHost targetHost) throws Throwable {
@@ -1035,14 +1183,14 @@ public class TestQueryTaskService {
         targetHost.testWait();
     }
 
-    private void nonpaginatedBroadcastQueryTasksOnExampleStates(VerificationHost targetHost)
+    private void nonpaginatedBroadcastQueryTasksOnExampleStates(VerificationHost targetHost, EnumSet<QueryOption> queryOptions)
             throws Throwable {
         QuerySpecification q = new QuerySpecification();
         Query kindClause = new Query();
         kindClause.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
                 .setTermMatchValue(Utils.buildKind(ExampleServiceState.class));
         q.query = kindClause;
-        q.options = EnumSet.of(QueryOption.EXPAND_CONTENT, QueryOption.BROADCAST);
+        q.options = queryOptions;
 
         QueryTask task = QueryTask.create(q);
 
@@ -1203,6 +1351,79 @@ public class TestQueryTaskService {
         assertTrue(documentLinksList.get(0).equals(documentLinksList.get(1)));
     }
 
+    private void lowLevelBroadcastQueryTasksWithOwnerSelection(VerificationHost targetHost, EnumSet<QueryOption> queryOptions)
+            throws Throwable {
+        QuerySpecification q = new QuerySpecification();
+        Query kindClause = new Query();
+        kindClause.setTermPropertyName(ServiceDocument.FIELD_NAME_KIND)
+                .setTermMatchValue(Utils.buildKind(ExampleServiceState.class));
+        q.query = kindClause;
+        q.options = queryOptions;
+
+        QueryTask task = QueryTask.create(q);
+        task.setDirect(true);
+
+        URI localQueryTaskFactoryUri = UriUtils.buildUri(targetHost,
+                ServiceUriPaths.CORE_LOCAL_QUERY_TASKS);
+        URI forwardingService = UriUtils.buildBroadcastRequestUri(localQueryTaskFactoryUri,
+                task.nodeSelectorLink);
+
+        targetHost.testStart(1);
+        // refer to LuceneQueryTaskService.createAndSendBroadcastQuery() to get the the internal result (before merge)
+        // so we can get each node's local query result, then verify whether we have got the authoritative result
+        Operation op = Operation
+                .createPost(forwardingService)
+                .setBody(task)
+                .setReferer(targetHost.getUri())
+                .setCompletion((o, e) -> {
+                    if (e != null) {
+                        targetHost.failIteration(e);
+                        return;
+                    }
+
+                    NodeGroupBroadcastResponse rsp = o.getBody((NodeGroupBroadcastResponse.class));
+
+                    if (!rsp.failures.isEmpty()) {
+                        targetHost.failIteration(new IllegalStateException(
+                                "Failures received: " + Utils.toJsonHtml(rsp)));
+                        return;
+                    }
+
+                    // check the correctness of rsp.jsonResponses, the internal result (before merge)
+                    int totalDocumentCount = 0;
+                    for (Map.Entry<URI, String> entry : rsp.jsonResponses.entrySet()) {
+                        QueryTask queryTask = Utils.fromJson(entry.getValue(), QueryTask.class);
+                        // calculate the total document count from each node's local query result
+                        totalDocumentCount += queryTask.results.documentCount;
+                        String queryTaskDocumentOwner = queryTask.documentOwner;
+                        // check whether each link's owner is the node itself
+                        for (String link : queryTask.results.documentLinks) {
+                            String linkOwner = Utils.fromJson(queryTask.results.documents.get(link),
+                                    ServiceDocument.class).documentOwner;
+                            // find non-authoritative result
+                            if (!linkOwner.equals(queryTaskDocumentOwner)) {
+                                targetHost.failIteration(new IllegalStateException("Non-authoritative result returned: "
+                                        + queryTaskDocumentOwner + " expected, but " + linkOwner + " returned"));
+                                return;
+                            }
+                        }
+                    }
+
+                    // check the total documents count
+                    if (this.serviceCount != totalDocumentCount) {
+                        targetHost.failIteration(new IllegalStateException("Incorrect number of documents returned: "
+                                + this.serviceCount + " expected, but " + totalDocumentCount + " returned"));
+                        return;
+                    }
+
+                    targetHost.completeIteration();
+                });
+
+        op.toggleOption(OperationOption.CONNECTION_SHARING, true);
+        targetHost.send(op);
+        targetHost.testWait();
+    }
+
     private void startPagedBroadCastQuery(VerificationHost targetHost) {
 
         // This is a multi stage task, that could be easily modeled as a service,
@@ -1332,6 +1553,35 @@ public class TestQueryTaskService {
             }
         };
         t.start();
+    }
+
+    @Test
+    public void verifyResponsePayloadSizeLimitChecks() throws Throwable {
+        // set response payload limit to a small number to force error
+        setUpHost(1024 * 50);
+        int sc = this.serviceCount * 2;
+        int versionCount = 2;
+        List<URI> services = createQueryTargetServices(sc);
+        QueryValidationServiceState newState = putStateOnQueryTargetServices(
+                services, versionCount);
+
+        // now issue a query that will effectively return a result set greater
+        // than the allowed size limit.
+        QueryTask.QuerySpecification q = new QueryTask.QuerySpecification();
+        q.options = EnumSet.of(QueryOption.EXPAND_CONTENT);
+        q.query.setTermPropertyName("stringValue")
+                .setTermMatchValue(newState.stringValue)
+                .setTermMatchType(MatchType.PHRASE);
+
+        boolean limitChecked = false;
+        try {
+            createWaitAndValidateQueryTask(versionCount, services, q, true, true);
+        } catch (ProtocolException ex) {
+            assertTrue(ex.getMessage().contains("/core/query-tasks returned error 500 for POST"));
+            limitChecked = true;
+        }
+        assertTrue("Expected QueryTask failure with INTERNAL_SERVER_ERROR because" +
+                "response payload size was over limit.", limitChecked);
     }
 
     @Test
@@ -1479,6 +1729,7 @@ public class TestQueryTaskService {
             ExampleServiceState s = new ExampleServiceState();
             s.name = UUID.randomUUID().toString();
             s.counter = new Long(Math.abs(r.nextLong()));
+            s.sortedCounter = new Long(Math.abs(r.nextLong()));
             s.documentSelfLink = s.name;
 
             exampleServices.add(UriUtils.buildUri(this.host.getUri(),
@@ -1491,15 +1742,32 @@ public class TestQueryTaskService {
         }
         this.host.testWait();
 
+        queryAndValidateSortedResults(ExampleServiceState.FIELD_NAME_COUNTER, TypeName.LONG,
+                exampleServices, resultLimit, isDirect);
+
+        queryAndValidateSortedResults(ExampleServiceState.FIELD_NAME_SORTED_COUNTER, TypeName.LONG,
+                exampleServices, resultLimit, isDirect);
+
+        List<URI> toDelete = queryAndValidateSortedResults(ExampleServiceState.FIELD_NAME_NAME,
+                TypeName.STRING, exampleServices, resultLimit, isDirect);
+
+        deleteServices(toDelete);
+    }
+
+    private List<URI> queryAndValidateSortedResults(String propertyName, TypeName propertyType,
+                                                    List<URI> exampleServices, int resultLimit,
+                                                    boolean isDirect) throws Throwable {
         Query kindClause = Query.Builder.create()
                 .addKindFieldClause(ExampleServiceState.class)
                 .build();
 
-        QueryTask.Builder queryTaskBuilder = isDirect ? QueryTask.Builder.createDirectTask()
+        QueryTask.Builder queryTaskBuilder = isDirect
+                ? QueryTask.Builder.createDirectTask()
                 : QueryTask.Builder.create();
+
         queryTaskBuilder
                 .setQuery(kindClause)
-                .orderDescending(ExampleServiceState.FIELD_NAME_COUNTER, TypeName.LONG)
+                .orderDescending(propertyName, propertyType)
                 .addOption(QueryOption.EXPAND_CONTENT)
                 .setResultLimit(resultLimit);
 
@@ -1535,8 +1803,8 @@ public class TestQueryTaskService {
                 pageLinks);
         this.host.testWait();
 
-        assertEquals(serviceCount, numberOfDocumentLinks[0]);
-        validateSortedResults(documents, ExampleServiceState.FIELD_NAME_COUNTER);
+        assertEquals(exampleServices.size(), numberOfDocumentLinks[0]);
+        validateSortedResults(documents, propertyName);
 
         // do another query but sort on self links
         numberOfDocumentLinks[0] = 0;
@@ -1568,10 +1836,10 @@ public class TestQueryTaskService {
                 pageLinks);
         this.host.testWait();
 
-        assertEquals(serviceCount, numberOfDocumentLinks[0]);
+        assertEquals(exampleServices.size(), numberOfDocumentLinks[0]);
         validateSortedResults(documents, ServiceDocument.FIELD_NAME_SELF_LINK);
 
-        deleteServices(toDelete);
+        return toDelete;
     }
 
     private void validateSortedResults(List<ExampleServiceState> documents, String fieldName) {
@@ -1583,8 +1851,10 @@ public class TestQueryTaskService {
             if (fieldName.equals(ServiceDocument.FIELD_NAME_SELF_LINK)) {
                 int r = currentDoc.documentSelfLink.compareTo(prevDoc.documentSelfLink);
                 assertTrue("Sort by self link failed", r > 0);
-            } else {
+            } else if (fieldName.equals(ExampleServiceState.FIELD_NAME_COUNTER)) {
                 assertTrue("Sort Test Failed", currentDoc.counter < prevDoc.counter);
+            } else if (fieldName.equals(ExampleServiceState.FIELD_NAME_SORTED_COUNTER)) {
+                assertTrue("Sort Test Failed", currentDoc.sortedCounter < prevDoc.sortedCounter);
             }
             prevDoc = currentDoc;
         }
@@ -1594,7 +1864,7 @@ public class TestQueryTaskService {
             throws Throwable {
 
         String prefix = "testPrefix";
-        List<URI> services = startQueryTargetServices(serviceCount);
+        List<URI> services = createQueryTargetServices(serviceCount);
 
         // start two different types of services, creating two sets of documents
         // first start the query validation service instances, setting the id
@@ -1707,7 +1977,7 @@ public class TestQueryTaskService {
         setUpHost();
         int sc = this.serviceCount;
         int versionCount = 2;
-        List<URI> services = startQueryTargetServices(sc);
+        List<URI> services = createQueryTargetServices(sc);
         // the PUT will increment the long field, so we will do queries over its
         // range
         putStateOnQueryTargetServices(services, versionCount);
@@ -1733,21 +2003,24 @@ public class TestQueryTaskService {
         assertTrue(finishedTaskState.results.documentLinks.size() == sc - offset
                 * 2 - 1);
 
+        long longMin = LONG_START_VALUE;
+        long longMax = LONG_START_VALUE + sc - 1;
+
         // do inclusive range search
         q = new QueryTask.QuerySpecification();
         q.query.setTermPropertyName(longFieldName).setNumericRange(
-                NumericRange.createLongRange(0L, (long) (sc - 1), true, true));
+                NumericRange.createLongRange(longMin, longMax, true, true));
         u = this.host.createQueryTaskService(QueryTask.create(q));
         finishedTaskState = this.host.waitForQueryTaskCompletion(q, services.size(),
                 versionCount, u, false, true);
         assertTrue(finishedTaskState.results != null);
         assertTrue(finishedTaskState.results.documentLinks != null);
-        assertTrue(finishedTaskState.results.documentLinks.size() == sc);
+        assertEquals(finishedTaskState.results.documentLinks.size(), sc);
 
         // do min side open range search
         q = new QueryTask.QuerySpecification();
         q.query.setTermPropertyName(longFieldName).setNumericRange(
-                NumericRange.createLongRange(null, (long) (sc - 1), true, true));
+                NumericRange.createLongRange(null, longMax, true, true));
         u = this.host.createQueryTaskService(QueryTask.create(q));
         finishedTaskState = this.host.waitForQueryTaskCompletion(q, services.size(),
                 versionCount, u, false, true);
@@ -1758,7 +2031,7 @@ public class TestQueryTaskService {
         // do max side open range search
         q = new QueryTask.QuerySpecification();
         q.query.setTermPropertyName(longFieldName).setNumericRange(
-                NumericRange.createLongRange(0L, null, true, true));
+                NumericRange.createLongRange(longMin, null, true, true));
         u = this.host.createQueryTaskService(QueryTask.create(q));
         finishedTaskState = this.host.waitForQueryTaskCompletion(q, services.size(),
                 versionCount, u, false, true);
@@ -1766,12 +2039,14 @@ public class TestQueryTaskService {
         assertTrue(finishedTaskState.results.documentLinks != null);
         assertTrue(finishedTaskState.results.documentLinks.size() == sc);
 
+        double doubleMin = (LONG_START_VALUE * 0.1) + DOUBLE_MIN_OFFSET;
+        double doubleMax = (LONG_START_VALUE * 0.1) + DOUBLE_MIN_OFFSET + (sc * 0.1);
+
         // double fields are 1 / 10 of the long fields
         // do double inclusive range search
         q = new QueryTask.QuerySpecification();
         q.query.setTermPropertyName(doubleFieldName).setNumericRange(
-                NumericRange.createDoubleRange(DOUBLE_MIN_OFFSET, DOUBLE_MIN_OFFSET + sc * 0.1,
-                        true, true));
+                NumericRange.createDoubleRange(doubleMin, doubleMax, true, true));
         u = this.host.createQueryTaskService(QueryTask.create(q));
         finishedTaskState = this.host.waitForQueryTaskCompletion(q, services.size(),
                 versionCount, u, false, true);
@@ -1782,7 +2057,7 @@ public class TestQueryTaskService {
         // do double range search with min inclusive
         q = new QueryTask.QuerySpecification();
         q.query.setTermPropertyName(doubleFieldName).setNumericRange(
-                NumericRange.createDoubleRange(DOUBLE_MIN_OFFSET, DOUBLE_MIN_OFFSET + sc * 0.05,
+                NumericRange.createDoubleRange(doubleMin, doubleMin + sc * 0.05,
                         true, false));
         u = this.host.createQueryTaskService(QueryTask.create(q));
         finishedTaskState = this.host.waitForQueryTaskCompletion(q, services.size(),
@@ -1791,6 +2066,28 @@ public class TestQueryTaskService {
         assertTrue(finishedTaskState.results.documentLinks != null);
         assertTrue(finishedTaskState.results.documentLinks.size() == sc / 2);
         verifyNoPaginatedIndexSearchers();
+
+        // do min side open range search
+        q = new QueryTask.QuerySpecification();
+        q.query.setTermPropertyName(doubleFieldName).setNumericRange(
+                NumericRange.createDoubleRange(null, doubleMax, true, true));
+        u = this.host.createQueryTaskService(QueryTask.create(q));
+        finishedTaskState = this.host.waitForQueryTaskCompletion(q, services.size(),
+                versionCount, u, false, true);
+        assertTrue(finishedTaskState.results != null);
+        assertTrue(finishedTaskState.results.documentLinks != null);
+        assertTrue(finishedTaskState.results.documentLinks.size() == sc);
+
+        // do max side open range search
+        q = new QueryTask.QuerySpecification();
+        q.query.setTermPropertyName(doubleFieldName).setNumericRange(
+                NumericRange.createDoubleRange(doubleMin, null, true, true));
+        u = this.host.createQueryTaskService(QueryTask.create(q));
+        finishedTaskState = this.host.waitForQueryTaskCompletion(q, services.size(),
+                versionCount, u, false, true);
+        assertTrue(finishedTaskState.results != null);
+        assertTrue(finishedTaskState.results.documentLinks != null);
+        assertTrue(finishedTaskState.results.documentLinks.size() == sc);
     }
 
     @Test
@@ -1812,7 +2109,7 @@ public class TestQueryTaskService {
         setUpHost();
         int sc = this.serviceCount;
         int versionCount = 2;
-        List<URI> services = startQueryTargetServices(sc);
+        List<URI> services = createQueryTargetServices(sc);
 
         // PUT a new state on all services, with one field set to the same
         // value;
@@ -1984,7 +2281,7 @@ public class TestQueryTaskService {
         int sc = this.serviceCount;
         int versionCount = 1;
         boolean includeAllVersions = false;
-        List<URI> services = startQueryTargetServices(sc);
+        List<URI> services = createQueryTargetServices(sc);
 
         TaskStage stage = TaskState.TaskStage.CREATED;
         QueryValidationServiceState newState = doTaskStageQuery(sc, 1, services, stage,
@@ -2057,7 +2354,7 @@ public class TestQueryTaskService {
 
         Runnable createServices = () -> {
             try {
-                List<URI> services = startQueryTargetServices(sc);
+                List<URI> services = createQueryTargetServices(sc);
 
                 putStateOnQueryTargetServices(services, versions);
             } catch (Throwable e) {
@@ -2134,7 +2431,7 @@ public class TestQueryTaskService {
 
     private URI doPaginatedQueryTest(QueryTask task, int sc, int resultLimit,
             List<URI> queryPageURIs, List<URI> targetServiceURIs) throws Throwable {
-        List<URI> services = startQueryTargetServices(sc);
+        List<URI> services = createQueryTargetServices(sc);
         if (targetServiceURIs == null) {
             targetServiceURIs = new ArrayList<>();
         }
@@ -2142,6 +2439,15 @@ public class TestQueryTaskService {
         targetServiceURIs.addAll(services);
         QueryValidationServiceState newState = putStateOnQueryTargetServices(
                 services, 1);
+
+        if (task.querySpec.options.contains(QueryOption.EXPAND_LINKS)) {
+            patchQueryTargetServiceLinksWithExampleLinks(targetServiceURIs);
+            task.querySpec.linkTerms = new ArrayList<>();
+            QueryTerm linkTerm = new QueryTerm();
+            linkTerm.propertyName = QueryValidationServiceState.FIELD_NAME_SERVICE_LINK;
+            linkTerm.propertyType = TypeName.STRING;
+            task.querySpec.linkTerms.add(linkTerm);
+        }
 
         task.querySpec.resultLimit = resultLimit;
 
@@ -2154,7 +2460,6 @@ public class TestQueryTaskService {
             // account for service creation above
             task.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
                     + task.documentExpirationTimeMicros;
-
         }
 
         URI taskURI = this.host.createQueryTaskService(task, false,
@@ -2178,12 +2483,12 @@ public class TestQueryTaskService {
 
         // update the index after the paginated query has been created to verify that its
         // stable while index searchers are updated
-        services = startQueryTargetServices(10);
+        services = createQueryTargetServices(10);
         targetServiceURIs.addAll(services);
         newState = putStateOnQueryTargetServices(services, 1);
 
         this.host.testStart(1);
-        getNextPageLinks(nextPageLink, resultLimit, numberOfDocumentLinks, queryPageURIs);
+        getNextPageLinks(task, nextPageLink, resultLimit, numberOfDocumentLinks, queryPageURIs);
         this.host.testWait();
 
         assertEquals(sc, numberOfDocumentLinks[0]);
@@ -2210,6 +2515,19 @@ public class TestQueryTaskService {
 
         deleteServices(targetServiceURIs);
 
+        // direct query, with expand links
+        task = QueryTask.create(new QuerySpecification()).setDirect(true);
+        task.querySpec.options.add(QueryOption.SELECT_LINKS);
+
+        task.querySpec.options.add(QueryOption.EXPAND_LINKS);
+        pageServiceURIs = new ArrayList<>();
+        targetServiceURIs = new ArrayList<>();
+        doPaginatedQueryTest(task, sc, resultLimit, pageServiceURIs, targetServiceURIs);
+        String nextPageLink = task.results.nextPageLink;
+        assertNotNull(nextPageLink);
+
+        deleteServices(targetServiceURIs);
+
         sc = 1;
         // direct query, single result expected, plus verify all previously deleted and created
         // documents are ignored
@@ -2217,7 +2535,7 @@ public class TestQueryTaskService {
         pageServiceURIs = new ArrayList<>();
         targetServiceURIs = new ArrayList<>();
         doPaginatedQueryTest(task, sc, resultLimit, pageServiceURIs, targetServiceURIs);
-        String nextPageLink = task.results.nextPageLink;
+        nextPageLink = task.results.nextPageLink;
         assertNotNull(nextPageLink);
 
         // delete target services before doing next query to verify deleted documents are excluded
@@ -2230,6 +2548,27 @@ public class TestQueryTaskService {
         pageServiceURIs = new ArrayList<>();
         targetServiceURIs = new ArrayList<>();
         doPaginatedQueryTest(task, sc, resultLimit, pageServiceURIs, targetServiceURIs);
+    }
+
+    private void patchQueryTargetServiceLinksWithExampleLinks(List<URI> targetServiceURIs)
+            throws Throwable {
+        // patch query target services with links to example services, then request link
+        // expansion
+        List<URI> exampleServices = new ArrayList<>();
+        createExampleServices(UriUtils.buildUri(this.host, ExampleService.FACTORY_LINK),
+                exampleServices);
+        TestContext ctx = this.host.testCreate(this.serviceCount);
+        for (int i = 0; i < targetServiceURIs.size(); i++) {
+            URI queryTargetService = targetServiceURIs.get(i);
+            URI exampleService = exampleServices.get(i);
+            QueryValidationServiceState patchBody = new QueryValidationServiceState();
+            patchBody.serviceLink = exampleService.getPath();
+            Operation patch = Operation.createPatch(queryTargetService)
+                    .setBody(patchBody)
+                    .setCompletion(ctx.getCompletion());
+            this.host.send(patch);
+        }
+        this.host.testWait(ctx);
     }
 
     private void deleteServices(List<URI> targetServiceURIs) throws Throwable {
@@ -2326,47 +2665,128 @@ public class TestQueryTaskService {
         verifyPaginatedIndexSearcherExpiration();
     }
 
-    private void getNextPageLinks(String nextPageLink, int resultLimit,
+    private void getNextPageLinks(QueryTask task, String nextPageLink, int resultLimit,
             final int[] numberOfDocumentLinks, final List<URI> serviceURIs) {
 
         URI u = UriUtils.buildUri(this.host, nextPageLink);
         serviceURIs.add(u);
 
+        CompletionHandler c = (o, e) -> {
+            try {
+                if (e != null) {
+                    this.host.failIteration(e);
+                    return;
+                }
+
+                QueryTask page = o.getBody(QueryTask.class);
+                int nlinks = page.results.documentLinks.size();
+                this.host.log("page: %s", Utils.toJsonHtml(page));
+                assertTrue(nlinks <= resultLimit);
+                verifyLinks(nextPageLink, serviceURIs, page);
+
+                numberOfDocumentLinks[0] += nlinks;
+
+                if (page.results.nextPageLink == null || nlinks == 0) {
+                    // complete only when we are out of pages
+                    this.host.completeIteration();
+                    return;
+                }
+
+                if (task.querySpec.options.contains(QueryOption.EXPAND_LINKS)) {
+                    validateExpandLinksResults(page);
+                }
+
+                getNextPageLinks(task, page.results.nextPageLink,
+                        resultLimit, numberOfDocumentLinks, serviceURIs);
+            } catch (Throwable e1) {
+                this.host.failIteration(e1);
+            }
+        };
+
         Operation get = Operation
                 .createGet(u)
-                .setCompletion((o, e) -> {
-                    try {
-                        if (e != null) {
-                            this.host.failIteration(e);
-                            return;
-                        }
-
-                        QueryTask page = o.getBody(QueryTask.class);
-                        int nlinks = page.results.documentLinks.size();
-                        this.host.log("page: %s", Utils.toJsonHtml(page));
-                        assertTrue(nlinks <= resultLimit);
-                        verifyLinks(nextPageLink, serviceURIs, page);
-
-                        numberOfDocumentLinks[0] += nlinks;
-
-                        if (page.results.nextPageLink == null || nlinks == 0) {
-                            // complete only when we are out of pages
-                            this.host.completeIteration();
-                            return;
-                        }
-
-                        getNextPageLinks(page.results.nextPageLink,
-                                resultLimit, numberOfDocumentLinks, serviceURIs);
-                    } catch (Throwable e1) {
-                        this.host.failIteration(e1);
-                    }
-                });
+                .setCompletion(c);
 
         this.host.send(get);
     }
 
+    private void validateSelectLinksQueryResults(QueryTask.QuerySpecification q, QueryTask task) {
+        assertTrue(!task.results.selectedLinksPerDocument.isEmpty());
+        assertTrue(!task.results.selectedLinks.isEmpty());
+
+        Set<String> uniqueLinks = new HashSet<>();
+
+        for (QueryTerm link : task.querySpec.linkTerms) {
+            for (String selflink : task.results.documentLinks) {
+                Map<String, String> selectedLinks = task.results.selectedLinksPerDocument.get(selflink);
+                assertTrue(!selectedLinks.isEmpty());
+
+                if (QueryValidationServiceState.FIELD_NAME_SERVICE_LINK
+                        .equals(link.propertyName)) {
+                    String linkValue = selectedLinks.get(link.propertyName);
+                    assertEquals(SERVICE_LINK_VALUE, linkValue);
+                    uniqueLinks.add(linkValue);
+                } else if (QueryValidationServiceState.FIELD_NAME_SERVICE_LINKS
+                        .equals(link.propertyName)) {
+                    for (Entry<String, String> e : selectedLinks.entrySet()) {
+                        assertTrue(e.getKey().startsWith(
+                                QueryValidationServiceState.FIELD_NAME_SERVICE_LINKS));
+                        uniqueLinks.add(e.getValue());
+                        assertTrue(e.getValue().startsWith(SERVICE_LINK_VALUE));
+                    }
+                } else {
+                    throw new IllegalStateException("Unexpected link property: "
+                            + Utils.toJsonHtml(task.results));
+                }
+            }
+        }
+        assertEquals(uniqueLinks.size(), task.results.selectedLinks.size());
+    }
+
+    private void validateExpandLinksResults(QueryTask page) {
+        assertEquals(page.results.documentLinks.size(), page.results.selectedLinksPerDocument.size());
+        assertEquals(page.results.documentLinks.size(), page.results.selectedLinks.size());
+        // since QueryValidationServiceState contains a single "serviceLink" field, we expect
+        // a single Map, per document. The map should contain the link property name, and the
+        // expanded value of the link, in this case a ExampleService state instance.
+        int linksFound = 0;
+        for (Map<String, String> selectedLinksPerDocument : page.results.selectedLinksPerDocument.values()) {
+            for (Entry<String, String> entry : selectedLinksPerDocument.entrySet()) {
+                if (!QueryValidationServiceState.FIELD_NAME_SERVICE_LINK.equals(entry.getKey())) {
+                    continue;
+                }
+                linksFound++;
+                String link = entry.getValue();
+                String jsonState = page.results.selectedDocuments.get(link);
+                ExampleServiceState expandedState = Utils.fromJson(jsonState,
+                        ExampleServiceState.class);
+                assertEquals(Utils.buildKind(ExampleServiceState.class), expandedState.documentKind);
+            }
+        }
+        assertEquals(page.results.documentLinks.size(), linksFound);
+    }
+
+    private void validatedExpandLinksResultsWithBogusLink(QueryTask queryTask,
+            URI queryValidationServiceWithBrokenServiceLink) {
+        assertEquals(this.serviceCount, queryTask.results.selectedLinksPerDocument.size());
+        for (Entry<String, Map<String, String>> e : queryTask.results.selectedLinksPerDocument.entrySet()) {
+            for (Entry<String, String> linkToExpandedState : e.getValue().entrySet()) {
+                String link = linkToExpandedState.getValue();
+                String jsonState = queryTask.results.selectedDocuments.get(link);
+                if (!e.getKey().equals(queryValidationServiceWithBrokenServiceLink.getPath())) {
+
+                    ExampleServiceState st = Utils.fromJson(jsonState, ExampleServiceState.class);
+                    assertEquals(Utils.buildKind(ExampleServiceState.class), st.documentKind);
+                    continue;
+                }
+                ServiceErrorResponse error = Utils.fromJson(jsonState, ServiceErrorResponse.class);
+                assertEquals(Operation.STATUS_CODE_NOT_FOUND, error.statusCode);
+            }
+        }
+    }
+
     private void verifyLinks(String nextPageLink, List<URI> serviceURIs, QueryTask page) {
-        assertEquals(LuceneQueryPageService.KIND, page.documentKind);
+        assertEquals(QueryPageService.KIND, page.documentKind);
         assertNotEquals(nextPageLink, page.results.nextPageLink);
         assertNotEquals(nextPageLink, page.results.prevPageLink);
 
@@ -2431,7 +2851,7 @@ public class TestQueryTaskService {
         setUpHost();
         int sc = 10;
         int iter = 10;
-        List<URI> services = startQueryTargetServices(sc);
+        List<URI> services = createQueryTargetServices(sc);
         QueryValidationServiceState newState = new QueryValidationServiceState();
         double currentStat;
         double newStat;
@@ -2486,6 +2906,9 @@ public class TestQueryTaskService {
             boolean isDirect)
             throws Throwable {
         QueryTask task = QueryTask.create(q).setDirect(isDirect);
+        if (q.options == null) {
+            q.options = EnumSet.noneOf(QueryOption.class);
+        }
         if (isDirect) {
             task.documentExpirationTimeMicros = Utils.getNowMicrosUtc()
                     + TimeUnit.MILLISECONDS.toMicros(100);
@@ -2497,7 +2920,7 @@ public class TestQueryTaskService {
                     forceRemote, true);
         }
 
-        if (q.options != null && q.options.contains(QueryOption.COUNT)) {
+        if (q.options.contains(QueryOption.COUNT)) {
             assertTrue(task.results.documentCount != null);
             assertTrue(task.results.documentCount == services.size() * (versionCount + 1));
             return;
@@ -2509,12 +2932,20 @@ public class TestQueryTaskService {
             verifyTaskAutoExpiration(u);
         }
 
-        if (q.options == null
-                || !q.options.contains(QueryOption.EXPAND_CONTENT)) {
+        if (q.options.contains(QueryOption.EXPAND_CONTENT)) {
+            assertTrue(task.results.documentLinks.size() == task.results.documents
+                    .size());
+        }
+
+        if (q.options.contains(QueryOption.EXPAND_LINKS)) {
+            validateExpandLinksResults(task);
             return;
         }
-        assertTrue(task.results.documentLinks.size() == task.results.documents
-                .size());
+
+        if (q.options.contains(QueryOption.SELECT_LINKS)) {
+            validateSelectLinksQueryResults(q, task);
+        }
+
     }
 
     @Test
@@ -2553,7 +2984,7 @@ public class TestQueryTaskService {
             Thread.sleep(100);
             ServiceDocumentQueryResult r = this.host.getServiceState(null,
                     ServiceDocumentQueryResult.class,
-                    UriUtils.buildUri(this.host, LuceneQueryTaskFactoryService.class));
+                    UriUtils.buildUri(this.host, QueryTaskFactoryService.class));
 
             if (r.documentLinks != null) {
                 boolean taskExists = false;
@@ -2617,7 +3048,7 @@ public class TestQueryTaskService {
 
         this.host.testStart(services.size() * versionsPerService);
         Random r = new Random();
-        long k = 0;
+        long k = LONG_START_VALUE;
         templateState.mapOfLongs = new HashMap<>();
         templateState.mapOfDoubles = new HashMap<>();
         for (URI u : services) {
@@ -2629,6 +3060,12 @@ public class TestQueryTaskService {
             templateState.mapOfDoubles.put("double", templateState.doubleValue);
             templateState.stringValue = TEXT_VALUE;
             templateState.serviceLink = SERVICE_LINK_VALUE;
+
+            templateState.serviceLinks = new ArrayList<>();
+            for (int i = 0; i < SERVICE_LINK_COUNT; i++) {
+                templateState.serviceLinks.add(SERVICE_LINK_VALUE + "." + i);
+            }
+
             for (int i = 0; i < versionsPerService; i++) {
                 // change all other fields, per service
                 templateState.booleanValue = r.nextBoolean();
@@ -2667,7 +3104,7 @@ public class TestQueryTaskService {
         return templateState;
     }
 
-    private List<URI> startQueryTargetServices(int serviceCount)
+    private List<URI> createQueryTargetServices(int serviceCount)
             throws Throwable {
         return startQueryTargetServices(serviceCount, new QueryValidationServiceState());
     }

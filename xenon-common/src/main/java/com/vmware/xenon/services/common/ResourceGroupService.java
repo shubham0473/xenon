@@ -37,8 +37,9 @@ public class ResourceGroupService extends StatefulService {
 
     /**
      * The {@link ResourceGroupState} holds a query that is used to represent a group of
-     * resources (services). {@link ResourceGroupState} and {@link UserGroupState) are used
-     * together in a {@link RoleState} to specify what resources a set of users has access to
+     * resources (services). {@link ResourceGroupState} and {@link UserGroupService.UserGroupState)
+     * are used together in a {@link AuthorizationContextService.Role} to specify what resources
+     * a set of users has access to.
      */
     public static class ResourceGroupState extends ServiceDocument {
         /**
@@ -71,8 +72,7 @@ public class ResourceGroupService extends StatefulService {
         if (!validate(op, state)) {
             return;
         }
-
-        op.complete();
+        AuthorizationCacheUtils.clearAuthzCacheForResourceGroup(this, op, state);
     }
 
     @Override
@@ -88,14 +88,19 @@ public class ResourceGroupService extends StatefulService {
         }
 
         ResourceGroupState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {
             setState(op, newState);
         }
+        AuthorizationCacheUtils.clearAuthzCacheForResourceGroup(this, op, currentState);
+    }
 
-        op.complete();
+    @Override
+    public void handleDelete(Operation op) {
+        ResourceGroupState currentState = getState(op);
+        AuthorizationCacheUtils.clearAuthzCacheForResourceGroup(this, op, currentState);
     }
 
     private boolean validate(Operation op, ResourceGroupState state) {

@@ -69,8 +69,7 @@ public class RoleService extends StatefulService {
         if (!validate(op, state)) {
             return;
         }
-
-        op.complete();
+        AuthorizationCacheUtils.clearAuthzCacheForRole(this, op, state);
     }
 
     @Override
@@ -86,14 +85,19 @@ public class RoleService extends StatefulService {
         }
 
         RoleState currentState = getState(op);
-        ServiceDocumentDescription documentDescription = this.getDocumentTemplate().documentDescription;
+        ServiceDocumentDescription documentDescription = getStateDescription();
         if (ServiceDocument.equals(documentDescription, currentState, newState)) {
             op.setStatusCode(Operation.STATUS_CODE_NOT_MODIFIED);
         } else {
             setState(op, newState);
         }
+        AuthorizationCacheUtils.clearAuthzCacheForRole(this, op, currentState);
+    }
 
-        op.complete();
+    @Override
+    public void handleDelete(Operation op) {
+        RoleState currentState = getState(op);
+        AuthorizationCacheUtils.clearAuthzCacheForRole(this, op, currentState);
     }
 
     private boolean validate(Operation op, RoleState state) {
