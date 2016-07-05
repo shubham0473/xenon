@@ -13,7 +13,6 @@ public class Host extends ServiceHost{
 	        h.initialize(arg);
 	        h.toggleDebuggingMode(true);
 	        h.start();
-	        h.log(Level.SEVERE, "entered main");
 	        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 	            h.log(Level.WARNING, "Host stopping ...");
 	            h.stop();
@@ -33,14 +32,17 @@ public class Host extends ServiceHost{
 	        super.log(Level.SEVERE, "Starting service");
 	        // start the example factory
 			super.startFactory(AppLevelInfoService.class, AppLevelInfoService::createFactory);
-	        super.startService(app);
+			super.startFactory(TierLevelInfoService.class, TierLevelInfoService::createFactory);
+			super.startService(app);
+			super.startService(tier);
+
 
 			System.out.println("host calling getappdata");
 			app.getApplicationData();
 
-			super.startFactory(TierLevelInfoService.class, TierLevelInfoService::createFactory);
-			super.startService(tier);
-			tier.getTierData();
+			Thread.sleep(10000);
+
+			tier.queryAppLinks();
 //
 //			super.startFactory(NodeLevelInfoService.class, NodeLevelInfoService::createFactory);
 //			super.startService(node);

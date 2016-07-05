@@ -14,8 +14,8 @@ import java.util.List;
 public class NodeLevelInfoService extends StatefulService {
 
 
-    public static final String SELF_LINK = ServiceUriPaths.CORE + "/info/tier";
-    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/info/tier";
+    public static final String SELF_LINK = ServiceUriPaths.CORE + "/info/node";
+    public static final String FACTORY_LINK = ServiceUriPaths.CORE + "/info/node";
 
     public String username = "shubham@customer1";
     public String password = "paradiddle";
@@ -133,7 +133,7 @@ public class NodeLevelInfoService extends StatefulService {
 
     public void createDocument(JSONObject node){
         QueryTask.Query appQuery = QueryTask.Query.Builder.create()
-                .addFieldClause(ServiceDocument.FIELD_NAME_KIND, Utils.buildKind(AppDetail.class))
+                .addFieldClause(ServiceDocument.FIELD_NAME_KIND, Utils.buildKind(NodeDetail.class))
                 .addFieldClause(TierDetail.FIELD_NAME_TIER_NAME, node.getString("name")).build();
 
         QueryTask queryTask = QueryTask.Builder.createDirectTask().setQuery(appQuery).build();
@@ -205,6 +205,66 @@ public class NodeLevelInfoService extends StatefulService {
         });
         this.sendRequest(op);
         return;
+    }
+
+    private TierDetail updateState(Operation update){
+        TierDetail body = getBody(update);
+        TierDetail currentState = getState(update);
+
+        boolean hasStateChanged = Utils.mergeWithState(getStateDescription(), currentState, body);
+
+        if(body.tierName != null){
+            currentState.tierName = body.tierName;
+        }
+
+        if(body.tierDescription != null){
+            currentState.tierDescription = body.tierDescription;
+        }
+
+        if(body.tierNodeCount != -1){
+            currentState.tierNodeCount = body.tierNodeCount;
+        }
+
+        if(body.tierAgentType != null){
+            currentState.tierAgentType = body.tierAgentType;
+        }
+        if(body.tierType != null){
+            currentState.tierType = body.tierType;
+        }
+
+        if (body.documentExpirationTimeMicros != 0) {
+            currentState.documentExpirationTimeMicros = body.documentExpirationTimeMicros;
+        }
+
+        update.setBody(currentState);
+        return currentState;
+    }
+
+
+    @Override
+    public void handlePatch(Operation patch) {
+        TierDetail updateState = updateState(patch);
+
+        if(updateState == null){
+            return;
+        }
+        patch.complete();
+    }
+
+
+    private JSONObject createRequestJson(JSONObject json){
+
+        JSONObject requestJson = new JSONObject();
+
+        requestJson.put("appName", "safdasdfasf");
+        requestJson.put("appId", 55);
+        requestJson.put("tierName", json.getString("name"));
+        requestJson.put("tierId", json.getInt("id"));
+        requestJson.put("tierDescription", json.getString("description"));
+        requestJson.put("tierAgentType", json.getString("agentType"));
+        requestJson.put("tierType", json.getString("type"));
+        requestJson.put("tierNodeCount", json.getInt("numberOfNodes"));
+        return requestJson;
     }
 
 }

@@ -1,4 +1,5 @@
 import com.vmware.xenon.common.ServiceDocument;
+import org.json.JSONObject;
 
 /**
  * Created by agrawalshubham on 7/4/2016.
@@ -32,7 +33,7 @@ public class NodeDetail extends ServiceDocument {
     public boolean appAgentPresent;
     public String appAgentVersion;
     public int nodeId;
-    public String nodeIpAddress;
+    public JSONObject nodeIpAddress;
     public boolean machineAgentPresent;
     public String machineAgentVersion;
     public int machineId;
