@@ -1,9 +1,16 @@
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceDocumentDescription;
+import com.vmware.xenon.services.common.TaskService;
 
 /**
  * Created by agrawalshubham on 7/4/2016.
  */
-public class TierDetail extends ServiceDocument {
+public class Tier extends TaskService.TaskServiceState {
+
+    public enum Action {
+        INITIALIZE, REFRESH, SYNC, LOAD
+    }
+
 
     public static final String FIELD_NAME_APP_NAME = "appName";
     public static final String FIELD_NAME_APP_ID = "appId";
@@ -13,6 +20,7 @@ public class TierDetail extends ServiceDocument {
     public static final String FIELD_NAME_AGENT_TYPE = "tierAgentType";
     public static final String FIELD_NAME_TYPE = "tierType";
     public static final String FIELD_NAME_NODE_COUNT = "tierNodeCount";
+    public static final String FIELD_NAME_PARENT_SELF_LINK = "parentSelfLink";
 
 
     public String appName;
@@ -23,5 +31,8 @@ public class TierDetail extends ServiceDocument {
     public String tierAgentType;
     public String tierType;
     public int tierNodeCount;
+    public String parentSelfLink;
 
+    @ServiceDocument.UsageOption(option = ServiceDocumentDescription.PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
+    public Action action;
 }

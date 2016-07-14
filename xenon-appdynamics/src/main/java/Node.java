@@ -1,10 +1,18 @@
 import com.vmware.xenon.common.ServiceDocument;
+import com.vmware.xenon.common.ServiceDocumentDescription;
+import com.vmware.xenon.services.common.TaskService;
 import org.json.JSONObject;
 
 /**
  * Created by agrawalshubham on 7/4/2016.
  */
-public class NodeDetail extends ServiceDocument {
+public class Node extends TaskService.TaskServiceState {
+
+    public enum Action {
+        INITIALIZE, REFRESH, SYNC, LOAD
+    }
+
+
 
     public static final String FIELD_NAME_APP_NAME = "appName";
     public static final String FIELD_NAME_APP_ID = "appId";
@@ -23,6 +31,7 @@ public class NodeDetail extends ServiceDocument {
     public static final String FIELD_NAME_NODE_NAME = "nodeName";
     public static final String FIELD_NAME_NODE_UNIQUE_LOCAL_ID = "nodeUniqueLocalId";
     public static final String FIELD_NAME_NODE_TYPE = "nodeType";
+    public static final String FIELD_NAME_PARENT_SELF_LINK = "parentSelfLink";
 
 
     public String appName;
@@ -43,5 +52,6 @@ public class NodeDetail extends ServiceDocument {
     public int nodeUniqueLocalId;
     public String nodeType;
 
-
+    @ServiceDocument.UsageOption(option = ServiceDocumentDescription.PropertyUsageOption.AUTO_MERGE_IF_NOT_NULL)
+    public Action action;
 }

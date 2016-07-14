@@ -13,15 +13,14 @@
 
 package com.vmware.xenon.common;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
-
-import java.util.UUID;
-
+import com.vmware.xenon.common.Service.Action;
 import org.junit.Before;
 import org.junit.Test;
 
-import com.vmware.xenon.common.Service.Action;
+import java.util.UUID;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 public class TestValidationError extends BasicReportTestCase {
     private static final String ERROR_MSG_NAME_REQUIRED = "name is required";

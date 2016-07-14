@@ -13,22 +13,17 @@
 
 package com.vmware.xenon.services.common;
 
+import com.vmware.xenon.common.*;
+import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
+import com.vmware.xenon.common.TaskState.TaskStage;
+import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
+import com.vmware.xenon.services.common.QueryTask.Query;
+
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-
-import com.vmware.xenon.common.FactoryService;
-import com.vmware.xenon.common.Operation;
-import com.vmware.xenon.common.OperationJoin;
-import com.vmware.xenon.common.ServiceDocumentDescription.PropertyUsageOption;
-import com.vmware.xenon.common.ServiceHost;
-import com.vmware.xenon.common.TaskState.TaskStage;
-import com.vmware.xenon.common.UriUtils;
-import com.vmware.xenon.common.Utils;
-import com.vmware.xenon.services.common.ExampleService.ExampleServiceState;
-import com.vmware.xenon.services.common.QueryTask.Query;
 
 /**
  * This is an example task service. When a new task is posted, it will delete ALL
